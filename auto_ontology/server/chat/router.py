@@ -102,7 +102,7 @@ from auto_ontology.server.chat.conversation_dal import (
 )
 from auto_ontology.server.chat.settings_dal import is_visualization_enabled
 from auto_ontology.server.chat.worker import PrewarmedWorker, get_pool
-from auto_ontology.server.identity import resolve_internal_user
+from auto_ontology.server.identity import resolve_internal_user, resolve_obo_context
 from auto_ontology.utils.llm_invoke import get_llm_client, get_non_reasoning_llm_client
 from auto_ontology.server.responses import ChatCancelResponse
 
@@ -573,6 +573,7 @@ async def chat_completions(
 
     # Conversation persistence trusts identity forwarded by the private Next.js
     # gateway; only calls that persist (i.e. carry a conversation_id) need it.
+    obo_context = resolve_obo_context(http_request, required=False)
     user_id = resolve_internal_user(
         http_request, required=request.conversation_id is not None
     )
@@ -662,6 +663,7 @@ async def chat_completions(
         subject_token=subject_token,
         conversation_history=conversation_history,
         evidence=request.evidence,
+        obo_context=obo_context,
     )
     threading.Thread(target=_pump, args=(slot,), daemon=True).start()
     asyncio.create_task(_watch_disconnect(http_request, slot))

@@ -94,6 +94,7 @@ def _worker_loop(
             fetch_acronyms,
             fetch_custom_prompts,
         )
+        from auto_ontology.server.identity import CallerOboContext, bind_obo_context
 
         # Eagerly build the heavyweights so they're hot before the first ask.
         data_retriever = get_data_objects_retriever()
@@ -141,63 +142,52 @@ def _worker_loop(
             subject_token,
             conversation_history,
             evidence,
-        ) = payload
+        ) = payload[:6]
+        obo_context: CallerOboContext | None = payload[6] if len(payload) > 6 else None
         try:
-            # Connections are resolved once at worker init. If that
-            # lookup came back empty — the store not yet reachable when this
-            # subprocess booted, or the first connection created afterwards —
-            # the snapshot would stay empty for the life of the process and
-            # every question would fail with "missing required 'connectors'"
-            # until the pod restarted. Re-resolve lazily so the worker heals
-            # itself; get_connectors() caches a non-empty result and only
-            # retries while there is nothing to cache, so this costs nothing
-            # on the normal path.
-            #
-            # This has to run BEFORE ``ask_connectors`` is bound: binding first
-            # would capture the stale empty list, and rebinding ``connectors``
-            # here would not update it, leaving the healing ineffective.
-            if not connectors:
-                connectors = get_connectors()
+            with bind_obo_context(obo_context):
+                if not connectors:
+                    connectors = get_connectors()
 
-            # Per-user Databricks auth trades the prewarmed connectors for ones
-            # bound to the caller's exchanged token. Databricks connectors open
-            # connections per operation, so rebuilding them here is cheap.
-            if subject_token is not None:
-                from auto_ontology.connectors.registry import (
-                    get_connectors_for_subject_token,
+                # Per-user Databricks auth trades the prewarmed connectors for ones
+                # bound to the caller's exchanged token. Databricks connectors open
+                # connections per operation, so rebuilding them here is cheap.
+                if subject_token is not None:
+                    from auto_ontology.connectors.registry import (
+                        get_connectors_for_subject_token,
+                    )
+
+                    ask_connectors = get_connectors_for_subject_token(subject_token)
+                else:
+                    ask_connectors = connectors
+
+                is_follow_up, processing_question = resolve_follow_up(
+                    question=question,
+                    history=conversation_history,
+                    llm=follow_up_llm,
                 )
+                logger.info(
+                    "Conversation context resolution: follow_up=%s processing_question=%s",
+                    is_follow_up,
+                    processing_question,
+                )
+                custom_prompts = fetch_custom_prompts()
 
-                ask_connectors = get_connectors_for_subject_token(subject_token)
-            else:
-                ask_connectors = connectors
-
-            is_follow_up, processing_question = resolve_follow_up(
-                question=question,
-                history=conversation_history,
-                llm=follow_up_llm,
-            )
-            logger.info(
-                "Conversation context resolution: follow_up=%s processing_question=%s",
-                is_follow_up,
-                processing_question,
-            )
-            custom_prompts = fetch_custom_prompts()
-
-            agent_payload = {
-                "question": question,
-                "evidence": evidence or "",
-                "processing_question": processing_question,
-                "prediction": prediction,
-                "data_retriever": data_retriever,
-                "semantic_retriever": semantic_retriever,
-                "connectors": ask_connectors,
-                "acronyms": fetch_acronyms(),
-                "custom_prompts": custom_prompts,
-            }
-            if target_db:
-                agent_payload["target_db"] = target_db
-            for event in stream_agent_response(agent_payload):
-                out_q.put((_TAG_EVENT, event))
+                agent_payload = {
+                    "question": question,
+                    "evidence": evidence or "",
+                    "processing_question": processing_question,
+                    "prediction": prediction,
+                    "data_retriever": data_retriever,
+                    "semantic_retriever": semantic_retriever,
+                    "connectors": ask_connectors,
+                    "acronyms": fetch_acronyms(),
+                    "custom_prompts": custom_prompts,
+                }
+                if target_db:
+                    agent_payload["target_db"] = target_db
+                for event in stream_agent_response(agent_payload):
+                    out_q.put((_TAG_EVENT, event))
         except BaseException as exc:  # noqa: BLE001 — surface to parent
             logger.exception("Agent run failed")
             try:
@@ -246,6 +236,7 @@ class PrewarmedWorker:
         subject_token: str | None = None,
         conversation_history: list[dict[str, str | None]] | None = None,
         evidence: str | None = None,
+        obo_context: Any | None = None,
     ) -> None:
         """Ask *question*, optionally forcing the prediction/SQL branch.
 
@@ -268,6 +259,7 @@ class PrewarmedWorker:
                     subject_token,
                     conversation_history or [],
                     evidence,
+                    obo_context,
                 ),
             )
         )

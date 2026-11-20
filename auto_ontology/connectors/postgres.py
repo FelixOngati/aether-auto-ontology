@@ -17,6 +17,8 @@ from psycopg_pool import ConnectionPool
 
 from auto_ontology.catalog.constants import TableTypes
 from auto_ontology.connectors.base import SQLDatabase, StatementTimeout
+from auto_ontology.connectors.session_context import postgres_rls_settings
+from auto_ontology.server.identity import CallerOboContext
 
 
 def _fetch_frame(
@@ -95,6 +97,7 @@ class PostgresDatabase(SQLDatabase):
         *,
         timeout_s: float | None = None,
         read_only: bool = False,
+        obo_context: CallerOboContext | None = None,
     ) -> pd.DataFrame:
         """Run *sql*; with *timeout_s*, the server cancels it after that long.
 
@@ -113,6 +116,7 @@ class PostgresDatabase(SQLDatabase):
             settings.append(("transaction_read_only", "on"))
         if timeout_s is not None:
             settings.append(("statement_timeout", f"{max(1, int(timeout_s * 1000))}ms"))
+        settings.extend(postgres_rls_settings(obo_context))
         with self._pool.connection() as conn:
             if not settings:
                 return _fetch_frame(conn, sql, parameters)

@@ -16,6 +16,8 @@ import pandas as pd
 
 from auto_ontology.catalog.constants import TableTypes
 from auto_ontology.connectors.base import SQLDatabase, StatementTimeout
+from auto_ontology.connectors.session_context import mysql_session_variables
+from auto_ontology.server.identity import CallerOboContext
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,7 @@ class MySQLDatabase(SQLDatabase):
     """Concrete :class:`SQLDatabase` backed by ``mysql-connector-python``."""
 
     supports_statement_timeout = True
+    supports_read_only = True
 
     def __init__(self, connection_string: str) -> None:
         self._connection_string = connection_string
@@ -119,6 +122,8 @@ class MySQLDatabase(SQLDatabase):
         parameters: Optional[list] = None,
         *,
         timeout_s: float | None = None,
+        read_only: bool = False,
+        obo_context: CallerOboContext | None = None,
     ) -> pd.DataFrame:
         """Run *sql*; with *timeout_s*, the server stops it after that long.
 
@@ -134,8 +139,16 @@ class MySQLDatabase(SQLDatabase):
             cursor = connection.cursor(dictionary=True)
             started = time.monotonic()
             try:
+                if read_only:
+                    cursor.execute("SET SESSION TRANSACTION READ ONLY")
                 if timeout_s is not None:
                     self._set_statement_timeout(cursor, timeout_s)
+                session_vars = mysql_session_variables(obo_context)
+                if session_vars:
+                    assignments = ", ".join(f"@{name} = %s" for name, _ in session_vars)
+                    cursor.execute(
+                        f"SET {assignments}", tuple(val for _, val in session_vars)
+                    )
                 cursor.execute(sql, parameters)
                 if cursor.description is None:
                     return pd.DataFrame()

@@ -13,6 +13,7 @@ from typing import Any, TypedDict
 from fastapi import APIRouter, HTTPException, Path
 from pydantic import BaseModel
 
+from auto_ontology.connectors.vault import VaultSecretError
 from auto_ontology.dal.connections import list_connections as _list_connections
 from auto_ontology.server.connections import service
 from auto_ontology.server.responses import (
@@ -25,6 +26,13 @@ from auto_ontology.server.responses import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_VAULT_UNAVAILABLE_DETAIL = "Credential vault is unavailable or misconfigured."
+
+
+def _raise_vault_unavailable(exc: VaultSecretError) -> None:
+    logger.error("Vault secret operation failed", exc_info=True)
+    raise HTTPException(status_code=503, detail=_VAULT_UNAVAILABLE_DETAIL) from exc
 
 
 class ConnectionBody(BaseModel):
@@ -72,7 +80,10 @@ def list_connections() -> dict:
     in the UI. ``database_name`` doubles as the connection's identity in the
     other routes here.
     """
-    rows = [_serialize_connection(conn) for conn in _list_connections()]
+    try:
+        rows = [_serialize_connection(conn) for conn in _list_connections()]
+    except VaultSecretError as exc:
+        _raise_vault_unavailable(exc)
     return {"data": rows, "count": len(rows)}
 
 
@@ -87,6 +98,8 @@ def test_connection(body: ConnectionTestBody) -> dict:
     """
     try:
         schemas = service.test_connection(body.connection, replacing=body.replacing)
+    except VaultSecretError as exc:
+        _raise_vault_unavailable(exc)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -110,6 +123,8 @@ def create_connection(body: ConnectionBody) -> dict:
     """
     try:
         row = service.create_connection(connection=body.connection)
+    except VaultSecretError as exc:
+        _raise_vault_unavailable(exc)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
@@ -143,6 +158,8 @@ def update_connection(
         row = service.update_connection(
             database_name=database_name, connection=body.connection
         )
+    except VaultSecretError as exc:
+        _raise_vault_unavailable(exc)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -177,6 +194,8 @@ def set_sso_federation(
         row = service.set_sso_federation(
             database_name=database_name, enabled=body.enabled
         )
+    except VaultSecretError as exc:
+        _raise_vault_unavailable(exc)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -205,6 +224,8 @@ def delete_connection(
     """
     try:
         row = service.delete_connection(database_name)
+    except VaultSecretError as exc:
+        _raise_vault_unavailable(exc)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:

@@ -19,7 +19,11 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 
-from auto_ontology.connectors.vault import read_secret
+from auto_ontology.connectors.vault import (
+    VaultSecretError,
+    is_vault_required,
+    read_secret,
+)
 from auto_ontology.dal import schema as s
 from auto_ontology.dal.session import store
 
@@ -46,6 +50,10 @@ def list_connections() -> list[dict[str, Any]]:
             continue
         stored = row["connection"]
         if stored:
+            if is_vault_required():
+                raise VaultSecretError(
+                    f"Plaintext Postgres connection fallback is disabled for {row['name']!r}"
+                )
             # jsonb here, a JSON *string* on the graph node. Callers get the
             # object either way, so decoding a string keeps a database written
             # before this column existed readable.
@@ -71,6 +79,11 @@ def insert_connection(
     # first, the secret was already stored when the insert 500s: no
     # catalog_database row, so the connection is invisible to list_connections
     # and cannot be ingested.
+    if is_vault_required() and connection and connection.strip():
+        raise VaultSecretError(
+            "Plaintext connection credentials cannot be stored in Postgres when "
+            "AUTO_ONTOLOGY_REQUIRE_VAULT is enabled"
+        )
     payload = json.loads(connection) if connection and connection.strip() else None
     statement = insert(s.catalog_database).values(
         name=database_name, connection=payload

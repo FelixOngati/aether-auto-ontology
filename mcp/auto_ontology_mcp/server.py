@@ -20,8 +20,9 @@ from mcp.types import Icon
 from auto_ontology_mcp import chat, readiness
 from auto_ontology_mcp.config import ConfigError, Settings
 from auto_ontology_mcp.auto_ontology_auth import (
-    build_auto_ontology_auth,
     auto_ontology_access_token,
+    auto_ontology_obo_claims,
+    build_auto_ontology_auth,
 )
 from auto_ontology_mcp.tools import (
     apply_description,
@@ -129,6 +130,9 @@ def load_icons() -> list[Icon]:
 
 
 BEARER_HEADER = "authorization"
+INTERNAL_USER_HEADER = "x-auto-ontology-user-id"
+INTERNAL_TENANT_HEADER = "x-auto-ontology-tenant-id"
+INTERNAL_ABAC_HEADER = "x-auto-ontology-abac"
 
 # Not a credential this server accepts — one it refuses. FastMCP copies the
 # incoming request's headers onto the outbound call, and Auto Ontology resolves an API key
@@ -160,12 +164,29 @@ class CallerAuth(httpx.Auth):
                 "through the Auto Ontology deployment this server is pointed at."
             )
 
-        # A request must never carry two identities, whichever slot the
-        # caller's arrived in, so drop both before setting ours.
-        for name in (API_KEY_HEADER, BEARER_HEADER):
+        # A request must never carry two identities or caller-spoofed internal
+        # OBO headers, whichever slot the caller's arrived in, so drop them
+        # before setting verified values.
+        for name in (
+            API_KEY_HEADER,
+            BEARER_HEADER,
+            INTERNAL_USER_HEADER,
+            INTERNAL_TENANT_HEADER,
+            INTERNAL_ABAC_HEADER,
+        ):
             if name in request.headers:
                 del request.headers[name]
         request.headers[BEARER_HEADER] = f"Bearer {token}"
+
+        obo = auto_ontology_obo_claims()
+        if obo.get("sub"):
+            request.headers[INTERNAL_USER_HEADER] = str(obo["sub"])
+        if obo.get("tenant_id"):
+            request.headers[INTERNAL_TENANT_HEADER] = str(obo["tenant_id"])
+        if obo.get("abac"):
+            request.headers[INTERNAL_ABAC_HEADER] = json.dumps(
+                obo["abac"], separators=(",", ":"), sort_keys=True
+            )
         yield request
 
 

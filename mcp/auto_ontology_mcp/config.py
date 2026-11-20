@@ -67,6 +67,15 @@ class Settings:
     # the server names for itself is the one they dialled — so a bind address
     # that is not how anyone addresses it needs this set explicitly.
     public_url: str = ""
+    workload_jwt_secret: str = ""
+    workload_jwt_issuer: str = ""
+    workload_jwt_audience: str = ""
+    workload_jwt_only: bool = False
+
+
+def _truthy(name: str) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _positive_float(name: str, default: float) -> float:
@@ -130,6 +139,18 @@ def load_settings() -> Settings:
     host = (os.environ.get("AUTO_ONTOLOGY_MCP_HOST") or DEFAULT_HOST).strip()
     port = _port("AUTO_ONTOLOGY_MCP_PORT", DEFAULT_PORT)
 
+    workload_jwt_secret = (
+        os.environ.get("AUTO_ONTOLOGY_WORKLOAD_JWT_SECRET")
+        or os.environ.get("OBO_SIGNING_SECRET")
+        or ""
+    ).strip()
+    workload_jwt_only = _truthy("AUTO_ONTOLOGY_WORKLOAD_JWT_ONLY")
+    if workload_jwt_only and not workload_jwt_secret:
+        raise ConfigError(
+            "AUTO_ONTOLOGY_WORKLOAD_JWT_ONLY requires "
+            "AUTO_ONTOLOGY_WORKLOAD_JWT_SECRET to be set."
+        )
+
     return Settings(
         # Trailing slashes make httpx base_url joins produce doubled separators.
         api_url=api_url.rstrip("/"),
@@ -141,6 +162,14 @@ def load_settings() -> Settings:
             "AUTO_ONTOLOGY_MCP_CHAT_TIMEOUT_S", DEFAULT_CHAT_TIMEOUT_S
         ),
         public_url=_public_url(host, port),
+        workload_jwt_secret=workload_jwt_secret,
+        workload_jwt_issuer=(
+            os.environ.get("AUTO_ONTOLOGY_WORKLOAD_JWT_ISSUER") or ""
+        ).strip(),
+        workload_jwt_audience=(
+            os.environ.get("AUTO_ONTOLOGY_WORKLOAD_JWT_AUDIENCE") or ""
+        ).strip(),
+        workload_jwt_only=workload_jwt_only,
     )
 
 

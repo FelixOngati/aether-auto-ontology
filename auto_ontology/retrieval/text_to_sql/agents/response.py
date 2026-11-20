@@ -80,6 +80,15 @@ class ResponseAgent(BaseAgent):
             "sql_columns": sql_columns,
             "custom_analyses_used": [],
             "sql_response_from_db": sql_response_from_db,
+            "target_db": path_state.get("target_db"),
+            "executed_queries": list(
+                path_state.get("executed_queries") or ([sql_code] if sql_code else [])
+            ),
+            "referenced_columns": list(path_state.get("referenced_columns") or []),
+            "pii_tags": dict(path_state.get("pii_tags") or {}),
+            "newly_ingested_columns": list(
+                path_state.get("newly_ingested_columns") or []
+            ),
         }
 
         self.logger.info("Calculation response prepared and returned")

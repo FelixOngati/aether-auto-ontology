@@ -9835,6 +9835,18 @@
             "minLength": 1,
             "title": "Question",
             "type": "string"
+          },
+          "target_db": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional catalog database name or UUID to scope coverage checks.",
+            "title": "Target Db"
           }
         },
         "required": ["question"],

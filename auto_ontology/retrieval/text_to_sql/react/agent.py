@@ -37,6 +37,55 @@ _UNANSWERED = (
 _NO_ASSUMPTIONS = "No assumptions were needed beyond what the question states."
 
 
+def _extract_executed_queries(
+    trajectory: list[dict[str, Any]], final_sql: str = ""
+) -> list[str]:
+    seen: list[str] = []
+    for step in trajectory:
+        for call in step.get("tool_calls") or []:
+            if call.get("name") in (ToolName.RUN_SQL, ToolName.SUBMIT):
+                sql = str((call.get("args") or {}).get("sql") or "").strip()
+                if sql and sql not in seen:
+                    seen.append(sql)
+    if final_sql and final_sql.strip() and final_sql.strip() not in seen:
+        seen.append(final_sql.strip())
+    return seen
+
+
+def _extract_table_governance(
+    tables: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, list[str]], list[str]]:
+    referenced_columns: list[str] = []
+    pii_tags: dict[str, list[str]] = {}
+    newly_ingested_columns: list[str] = []
+    for tbl in tables:
+        if not isinstance(tbl, dict):
+            continue
+        table_name = str(tbl.get("table_name") or tbl.get("name") or "").strip()
+        schema_name = str(tbl.get("schema_name") or tbl.get("schema") or "").strip()
+        prefix = f"{schema_name}.{table_name}" if schema_name else table_name
+        for col in tbl.get("columns") or []:
+            if not isinstance(col, dict):
+                continue
+            col_name = str(col.get("column_name") or col.get("name") or "").strip()
+            if not col_name:
+                continue
+            qualified = f"{prefix}.{col_name}" if prefix else col_name
+            if qualified not in referenced_columns:
+                referenced_columns.append(qualified)
+            raw_tags = col.get("pii_tags") or col.get("tags") or []
+            if isinstance(raw_tags, list):
+                tags = [str(t) for t in raw_tags if str(t).strip()]
+                if tags:
+                    pii_tags[qualified] = tags
+            if (
+                col.get("newly_ingested") is True
+                and qualified not in newly_ingested_columns
+            ):
+                newly_ingested_columns.append(qualified)
+    return referenced_columns, pii_tags, newly_ingested_columns
+
+
 def _tool_thought(call: dict[str, Any]) -> str:
     args = call.get("args") or {}
     name = call.get("name")
@@ -103,7 +152,12 @@ class ReactSQLAgent(BaseAgent):
                 record_thought(path_state, STEP_NAME, _tool_thought(call))
         path_state["react_trajectory"] = result.trajectory
         path_state["react_end_reason"] = result.reason
-        path_state["relevant_tables"] = list(ctx.seen_tables.values())
+        relevant_tables = list(ctx.seen_tables.values())
+        path_state["relevant_tables"] = relevant_tables
+        ref_cols, pii_map, new_cols = _extract_table_governance(relevant_tables)
+        path_state["referenced_columns"] = ref_cols
+        path_state["pii_tags"] = pii_map
+        path_state["newly_ingested_columns"] = new_cols
 
         if result.prediction is not None:
             response = result.prediction.response
@@ -142,6 +196,9 @@ class ReactSQLAgent(BaseAgent):
             }
 
         path_state["sql_code"] = submission.sql
+        path_state["executed_queries"] = _extract_executed_queries(
+            result.trajectory, submission.sql
+        )
         path_state["sql_generation_result"] = SQLGenerationModel(
             thought=submission.assumptions or _NO_ASSUMPTIONS,
             sql_code=submission.sql,

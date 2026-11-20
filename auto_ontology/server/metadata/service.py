@@ -45,13 +45,21 @@ class PredictionFlowError(RuntimeError):
 def _build_coverage_payload(
     question: str,
     max_distance: float = DEFAULT_MAX_DISTANCE,
+    target_db: str | None = None,
 ) -> EntityCoveragePayload:
     """Assemble the payload for the entity-coverage pipeline."""
     connectors = get_connectors()
+    if target_db and target_db.strip():
+        requested = target_db.strip().casefold()
+        connectors = [
+            c
+            for c in connectors
+            if str(getattr(c, "database_name", "")).casefold() == requested
+        ]
     if not connectors:
         raise PredictionFlowError("No database connection is configured.")
     custom_prompts = fetch_custom_prompts()
-    return {
+    payload: EntityCoveragePayload = {
         "question": question,
         "data_retriever": get_data_objects_retriever(),
         "semantic_retriever": get_semantic_objects_retriever(),
@@ -60,11 +68,13 @@ def _build_coverage_payload(
         "custom_prompts": custom_prompts,
         "max_distance": max_distance,
     }
+    return payload
 
 
 def entity_coverage(
     question: str,
     max_distance: float = DEFAULT_MAX_DISTANCE,
+    target_db: str | None = None,
 ) -> dict:
     """Return ranked semantic candidates and a 0–1 entity coverage grade.
 
@@ -75,7 +85,9 @@ def entity_coverage(
     with _run_lock:
         try:
             return get_coverage_response(
-                _build_coverage_payload(question, max_distance=max_distance)
+                _build_coverage_payload(
+                    question, max_distance=max_distance, target_db=target_db
+                )
             )
         except (ValueError, RuntimeError) as exc:
             raise PredictionFlowError(str(exc)) from exc

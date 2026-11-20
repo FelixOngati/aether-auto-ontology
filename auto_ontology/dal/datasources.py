@@ -508,9 +508,17 @@ def store_column_sample_values(table_id: str, samples: dict[str, list]) -> None:
     """
     if not samples:
         return
+    from auto_ontology.semantic.sample_scrubber import (
+        is_sample_scrubbing_enabled,
+        scrub_sample_mapping,
+    )
+
+    cleaned = (
+        scrub_sample_mapping(samples) if is_sample_scrubbing_enabled() else samples
+    )
     encoded = {
         name: dumped
-        for name, values in samples.items()
+        for name, values in cleaned.items()
         if (dumped := dump_sample_values(values)) is not None
     }
     _set_column_property(table_id, encoded, "sample_values")
@@ -565,9 +573,15 @@ def store_column_distinct_values(table_id: str, values: dict[str, list]) -> None
     Encoded like ``sample_values`` (types kept, nulls dropped), and a column
     whose list holds nothing is left alone.
     """
+    from auto_ontology.semantic.sample_scrubber import (
+        is_sample_scrubbing_enabled,
+        scrub_sample_mapping,
+    )
+
+    cleaned = scrub_sample_mapping(values) if is_sample_scrubbing_enabled() else values
     encoded = {
         name: dumped
-        for name, column_values in values.items()
+        for name, column_values in cleaned.items()
         if (dumped := dump_sample_values(column_values)) is not None
     }
     _set_column_property(table_id, encoded, "distinct_values")

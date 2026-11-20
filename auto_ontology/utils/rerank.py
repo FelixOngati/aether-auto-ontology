@@ -20,11 +20,41 @@ Any other URL is treated as a NIM base and gets ``/v1/ranking`` appended.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import httpx
 
-from auto_ontology.utils.model_config import resolve
+from auto_ontology.utils.model_config import is_offline_perimeter_enabled, resolve
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def is_rerank_enabled(rerank_invoke_url: str | None = None) -> bool:
+    """Return ``True`` when neural reranking is enabled and configured.
+
+    Setting ``AUTO_ONTOLOGY_DISABLE_RERANK=1`` cleanly bypasses external rerank
+    HTTP calls for 3-model CPU deployments without raising runtime errors.
+    """
+    if os.environ.get("AUTO_ONTOLOGY_DISABLE_RERANK", "").strip().lower() in _TRUTHY:
+        return False
+    effective_url = (
+        rerank_invoke_url
+        if rerank_invoke_url is not None
+        else resolve("RERANK", "ENDPOINT")
+    )
+    if not effective_url.strip():
+        return False
+    if (
+        is_offline_perimeter_enabled()
+        and not os.environ.get("RERANK_ENDPOINT", "").strip()
+    ):
+        # In offline perimeter mode, only invoke rerank if RERANK_ENDPOINT was
+        # explicitly pointed at a local ranking service rather than inheriting a
+        # chat/completions base URL.
+        return False
+    return True
+
 
 # Hosted NeMo reranking endpoint — no local GPU required. Override RERANK_ENDPOINT
 # to point at a self-hosted vLLM/NIM ranking server. Each field falls back to
@@ -111,6 +141,15 @@ def rerank_hits(
     """
     if not hits:
         return hits
+    if (
+        os.environ.get("AUTO_ONTOLOGY_DISABLE_RERANK", "").strip().lower() in _TRUTHY
+        or not rerank_invoke_url.strip()
+    ):
+        preserved = [
+            hit if "_rerank_score" in hit else {"_rerank_score": 0.0, **hit}
+            for hit in hits
+        ]
+        return preserved[:top_n] if top_n is not None else preserved
     scores = _scores(
         query,
         [str(hit.get(text_key) or "") for hit in hits],

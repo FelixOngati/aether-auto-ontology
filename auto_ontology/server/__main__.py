@@ -57,6 +57,9 @@ from auto_ontology.server.search.router import router as search_router  # noqa: 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    from auto_ontology.utils.model_config import enforce_offline_perimeter_config
+
+    enforce_offline_perimeter_config()
     # Before anything else: refuse to serve against a schema this build does not
     # expect. Here rather than in `create_app` deliberately — the OpenAPI spec
     # generator builds the app with no database at all (see that docstring), so

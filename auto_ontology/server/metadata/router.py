@@ -28,6 +28,12 @@ class EntityCoverageRequest(BaseModel):
             "(lower score = closer match)."
         ),
     )
+    target_db: str | None = Field(
+        default=None,
+        description=(
+            "Optional catalog database name or UUID to scope coverage checks."
+        ),
+    )
 
 
 @router.post("/question-entity-coverage", response_model=EntityCoverageResponse)
@@ -44,6 +50,7 @@ def entity_coverage(body: EntityCoverageRequest) -> dict:
         result = dal.entity_coverage(
             body.question,
             max_distance=body.max_distance,
+            target_db=body.target_db,
         )
     except dal.PredictionFlowError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

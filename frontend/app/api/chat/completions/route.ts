@@ -65,7 +65,10 @@ export const POST = withPermission({ chat: ['use'] })(async (req, { user }) => {
 		'Content-Type': 'application/json',
 		Accept: 'text/event-stream',
 		[SOURCE_HEADER]: req.headers.get(SOURCE_HEADER) ?? 'api',
-		...buildInternalIdentityHeaders(user.id),
+		...buildInternalIdentityHeaders(user.id, {
+			tenantId: user.tenantId,
+			abac: user.abac,
+		}),
 	};
 
 	const subjectToken = await resolveSubjectToken(req.headers, user.id);

@@ -57,6 +57,7 @@ def _mint_jwt(claims: dict[str, Any], secret: str = "unit-test-secret") -> str:
 def test_forwarded_header_resolves_user(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AUTO_ONTOLOGY_WORKLOAD_JWT_SECRET", raising=False)
     monkeypatch.delenv("OBO_SIGNING_SECRET", raising=False)
+    monkeypatch.delenv("AUTO_ONTOLOGY_WORKLOAD_JWT_ONLY", raising=False)
     user_id = resolve_internal_user(
         _request({"x-auto-ontology-user-id": "user-1"}),
         required=True,
@@ -76,7 +77,7 @@ def test_stateless_request_without_identity_remains_supported() -> None:
     assert resolve_internal_user(_request({}), required=False) is None
 
 
-def test_signed_workload_jwt_resolves_obo_context_and_rejects_spoofed_header(
+def test_signed_workload_jwt_resolves_obo_context_and_rejects_spoofed_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AUTO_ONTOLOGY_WORKLOAD_JWT_SECRET", "unit-test-secret")
@@ -98,15 +99,107 @@ def test_signed_workload_jwt_resolves_obo_context_and_rejects_spoofed_header(
     assert obo.region == "EMEA"
     assert obo.roles == ("analyst",)
 
-    with pytest.raises(HTTPException) as spoof_exc:
-        resolve_obo_context(
-            _request({"x-auto-ontology-tenant-id": "tenant-b"}), required=False
-        )
-    assert spoof_exc.value.status_code == 401
+    for spoof_headers in (
+        {"x-auto-ontology-tenant-id": "tenant-b"},
+        {"x-auto-ontology-user-id": "admin-spoof"},
+        {
+            "x-auto-ontology-user-id": "admin-spoof",
+            "x-auto-ontology-abac": '{"region":"GLOBAL","roles":["admin"]}',
+        },
+        {
+            "Authorization": "Bearer opaque-garbage",
+            "x-auto-ontology-user-id": "admin-spoof",
+            "x-auto-ontology-abac": '{"region":"GLOBAL","roles":["admin"]}',
+        },
+        {"Authorization": "Basic dXNlcjpwYXNz"},
+    ):
+        with pytest.raises(HTTPException) as spoof_exc:
+            resolve_obo_context(_request(spoof_headers), required=False)
+        assert spoof_exc.value.status_code == 401
 
     with pytest.raises(HTTPException) as bad_sig:
         verify_workload_jwt(tok, secret="different-secret")
     assert bad_sig.value.status_code == 401
+
+
+def test_workload_jwt_top_level_claims_multi_issuer_nbf_leeway_and_max_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTO_ONTOLOGY_WORKLOAD_JWT_SECRET", "unit-test-secret")
+    monkeypatch.setenv(
+        "AUTO_ONTOLOGY_WORKLOAD_JWT_ISSUER",
+        "aether-mcp-connectors, aether-control-plane",
+    )
+    monkeypatch.setenv("AUTO_ONTOLOGY_WORKLOAD_JWT_AUDIENCE", "auto-ontology-mcp")
+    monkeypatch.setenv("AUTO_ONTOLOGY_WORKLOAD_JWT_MAX_TTL_S", "600")
+    now = int(time.time())
+
+    admin_tok = _mint_jwt(
+        {
+            "sub": "svc:control-plane",
+            "tenant_id": "tenant-cp",
+            "iss": "aether-control-plane",
+            "aud": ["auto-ontology-mcp"],
+            "iat": now - 5,
+            "nbf": now + 10,  # within default 30s clock-skew leeway
+            "exp": now + 300,
+            "region": "GLOBAL",
+            "roles": ["admin"],
+            "workflow_run_id": "wf-run-99",
+        }
+    )
+    obo = verify_workload_jwt(admin_tok)
+    assert obo.user_id == "svc:control-plane"
+    assert obo.tenant_id == "tenant-cp"
+    assert obo.region == "GLOBAL"
+    assert obo.roles == ("admin",)
+    assert obo.workflow_run_id == "wf-run-99"
+    assert obo.abac == {
+        "region": "GLOBAL",
+        "roles": ["admin"],
+        "workflow_run_id": "wf-run-99",
+    }
+
+    future_nbf = _mint_jwt(
+        {
+            "sub": "u1",
+            "tenant_id": "t1",
+            "iss": "aether-mcp-connectors",
+            "aud": "auto-ontology-mcp",
+            "nbf": now + 120,
+            "exp": now + 300,
+        }
+    )
+    with pytest.raises(HTTPException) as nbf_exc:
+        verify_workload_jwt(future_nbf)
+    assert nbf_exc.value.status_code == 401
+
+    over_ttl = _mint_jwt(
+        {
+            "sub": "u1",
+            "tenant_id": "t1",
+            "iss": "aether-mcp-connectors",
+            "aud": "auto-ontology-mcp",
+            "iat": now,
+            "exp": now + 3600,
+        }
+    )
+    with pytest.raises(HTTPException) as ttl_exc:
+        verify_workload_jwt(over_ttl)
+    assert ttl_exc.value.status_code == 401
+
+    wrong_iss = _mint_jwt(
+        {
+            "sub": "u1",
+            "tenant_id": "t1",
+            "iss": "untrusted-issuer",
+            "aud": "auto-ontology-mcp",
+            "exp": now + 120,
+        }
+    )
+    with pytest.raises(HTTPException) as iss_exc:
+        verify_workload_jwt(wrong_iss)
+    assert iss_exc.value.status_code == 401
 
 
 def test_bind_obo_context_scopes_and_resets() -> None:

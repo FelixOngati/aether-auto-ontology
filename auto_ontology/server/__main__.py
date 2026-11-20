@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import uvicorn
 from auto_ontology.env import load_env
 
@@ -46,6 +47,11 @@ from auto_ontology.server.terms.router import router as terms_router  # noqa: E4
 from auto_ontology.server.model_interchange.router import (  # noqa: E402
     router as model_interchange_router,
 )
+from auto_ontology.server.identity import (  # noqa: E402
+    bind_obo_context,
+    is_workload_auth_required,
+    resolve_obo_context,
+)
 from auto_ontology.server.search.router import router as search_router  # noqa: E402
 
 
@@ -71,6 +77,24 @@ async def lifespan(_app: FastAPI):
         close_store()
 
 
+_PUBLIC_PATHS = frozenset(
+    {
+        "/openapi.json",
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/redoc",
+    }
+)
+
+
+def _is_public_path(path: str) -> bool:
+    return (
+        path in _PUBLIC_PATHS
+        or path == "/api/health"
+        or path.startswith("/api/health/")
+    )
+
+
 def create_app() -> FastAPI:
     """Build the API app without serving it.
 
@@ -79,6 +103,21 @@ def create_app() -> FastAPI:
     starting uvicorn.
     """
     app = FastAPI(title="Auto Ontology API", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def obo_context_middleware(request: Request, call_next):
+        if request.method == "OPTIONS" or _is_public_path(request.url.path):
+            return await call_next(request)
+        try:
+            obo = resolve_obo_context(
+                request, required=is_workload_auth_required(request)
+            )
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code, content={"detail": exc.detail}
+            )
+        with bind_obo_context(obo):
+            return await call_next(request)
 
     app.add_middleware(
         CORSMiddleware,

@@ -35,6 +35,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import time
 from typing import Any
 
@@ -117,9 +118,30 @@ class AutoOntologyTokenVerifier(TokenVerifier):
         )
 
 
+DEFAULT_CLOCK_SKEW_S = 30
+DEFAULT_MAX_TTL_S = 86_400
+
+
 def _b64url_decode(segment: str) -> bytes:
     padded = segment + "=" * (-len(segment) % 4)
     return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _positive_int_env(name: str, default: int, *, allow_zero: bool = False) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < 0 or (value == 0 and not allow_zero):
+        return default
+    return value
 
 
 class WorkloadJwtVerifier(TokenVerifier):
@@ -138,11 +160,15 @@ class WorkloadJwtVerifier(TokenVerifier):
         *,
         issuer: str = "",
         audience: str = "",
+        clock_skew_s: int | None = None,
+        max_ttl_s: int | None = None,
     ) -> None:
         super().__init__()
         self._secret = secret.encode("utf-8")
-        self._issuer = issuer
-        self._audience = audience
+        self._issuers = {item.strip() for item in issuer.split(",") if item.strip()}
+        self._audience = audience.strip()
+        self._clock_skew_s = clock_skew_s
+        self._max_ttl_s = max_ttl_s
 
     async def verify_token(self, token: str) -> AccessToken | None:
         parts = token.split(".")
@@ -167,20 +193,46 @@ class WorkloadJwtVerifier(TokenVerifier):
             return None
 
         now = int(time.time())
+        skew = (
+            self._clock_skew_s
+            if self._clock_skew_s is not None
+            else _positive_int_env(
+                "AUTO_ONTOLOGY_WORKLOAD_JWT_CLOCK_SKEW_S",
+                DEFAULT_CLOCK_SKEW_S,
+                allow_zero=True,
+            )
+        )
+        max_ttl = (
+            self._max_ttl_s
+            if self._max_ttl_s is not None
+            else _positive_int_env(
+                "AUTO_ONTOLOGY_WORKLOAD_JWT_MAX_TTL_S", DEFAULT_MAX_TTL_S
+            )
+        )
+
         exp = payload.get("exp")
-        if not isinstance(exp, (int, float)) or int(exp) <= now:
+        if not _is_number(exp) or int(exp) + skew <= now:
+            return None
+        if int(exp) - now > max_ttl + skew:
             return None
 
         nbf = payload.get("nbf")
-        if nbf is not None and (not isinstance(nbf, (int, float)) or int(nbf) > now):
+        if nbf is not None and (not _is_number(nbf) or int(nbf) - skew > now):
             return None
 
-        if self._issuer and str(payload.get("iss") or "") != self._issuer:
+        iat = payload.get("iat")
+        if iat is not None:
+            if not _is_number(iat) or int(iat) - skew > now:
+                return None
+            if int(exp) - int(iat) > max_ttl:
+                return None
+
+        if self._issuers and str(payload.get("iss") or "").strip() not in self._issuers:
             return None
         if self._audience:
             aud = payload.get("aud")
             aud_values = aud if isinstance(aud, list) else [aud]
-            if self._audience not in [str(a) for a in aud_values if a is not None]:
+            if self._audience not in {str(a) for a in aud_values if a is not None}:
                 return None
 
         subject = str(payload.get("sub") or "").strip()
@@ -188,9 +240,30 @@ class WorkloadJwtVerifier(TokenVerifier):
         if not subject or not tenant_id:
             return None
 
-        abac = payload.get("abac")
-        if abac is not None and not isinstance(abac, dict):
+        raw_abac = payload.get("abac")
+        if raw_abac is not None and not isinstance(raw_abac, dict):
             return None
+        abac = dict(raw_abac) if isinstance(raw_abac, dict) else {}
+
+        region = str(abac.get("region") or payload.get("region") or "").strip()
+        raw_roles = abac.get("roles") if "roles" in abac else payload.get("roles")
+        if raw_roles is not None and not isinstance(raw_roles, (list, tuple)):
+            return None
+        roles = (
+            [str(r).strip() for r in raw_roles if str(r).strip()]
+            if isinstance(raw_roles, (list, tuple))
+            else []
+        )
+        workflow_run_id = str(
+            abac.get("workflow_run_id") or payload.get("workflow_run_id") or ""
+        ).strip()
+
+        if region and "region" not in abac:
+            abac["region"] = region
+        if roles and "roles" not in abac:
+            abac["roles"] = roles
+        if workflow_run_id and "workflow_run_id" not in abac:
+            abac["workflow_run_id"] = workflow_run_id
 
         raw_scopes = payload.get("scope") or payload.get(SCOPE_CLAIM) or ""
         scopes = (
@@ -202,8 +275,14 @@ class WorkloadJwtVerifier(TokenVerifier):
         claims: dict[str, Any] = {
             "sub": subject,
             "tenant_id": tenant_id,
-            "abac": dict(abac) if isinstance(abac, dict) else {},
+            "abac": abac,
         }
+        if region:
+            claims["region"] = region
+        if roles:
+            claims["roles"] = roles
+        if workflow_run_id:
+            claims["workflow_run_id"] = workflow_run_id
         if "iss" in payload:
             claims["iss"] = payload["iss"]
         if "aud" in payload:
@@ -222,7 +301,14 @@ class WorkloadJwtVerifier(TokenVerifier):
 
 
 class CompositeTokenVerifier(TokenVerifier):
-    """Verify signed workload JWTs locally and delegate opaque grants to UserInfo."""
+    """Verify signed workload JWTs locally and delegate opaque grants to UserInfo.
+
+    Auto Ontology's Better Auth OAuth access tokens are strictly opaque
+    (non-JWT), whereas workload OBO credentials are three-segment JWTs. Never
+    fall through from a rejected three-segment JWT to ``USERINFO_PATH``: doing
+    so would leak forged/expired HS256 tokens outbound and accept SSO JWTs
+    lacking a ``tenant_id`` claim.
+    """
 
     def __init__(
         self,
@@ -235,9 +321,7 @@ class CompositeTokenVerifier(TokenVerifier):
 
     async def verify_token(self, token: str) -> AccessToken | None:
         if token.count(".") == 2:
-            verified = await self._workload.verify_token(token)
-            if verified is not None:
-                return verified
+            return await self._workload.verify_token(token)
         return await self._remote.verify_token(token)
 
 

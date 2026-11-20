@@ -48,12 +48,12 @@ def list_connections() -> list[dict[str, Any]]:
         if secret:
             connections.append(secret)
             continue
-        if is_vault_required():
-            raise VaultSecretError(
-                f"Plaintext Postgres connection fallback is disabled for {row['name']!r}"
-            )
         stored = row["connection"]
         if stored:
+            if is_vault_required():
+                raise VaultSecretError(
+                    f"Plaintext Postgres connection fallback is disabled for {row['name']!r}"
+                )
             # jsonb here, a JSON *string* on the graph node. Callers get the
             # object either way, so decoding a string keeps a database written
             # before this column existed readable.

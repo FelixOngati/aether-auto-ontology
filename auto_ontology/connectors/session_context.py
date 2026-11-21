@@ -94,6 +94,51 @@ def require_postgres_tenant_guc(
     return settings
 
 
+def postgres_rbac_role(obo_context: CallerOboContext | None = None) -> str | None:
+    """Resolve an optional transaction-local PostgreSQL ``SET LOCAL ROLE`` target.
+
+    Activated when either:
+    - ``AUTO_ONTOLOGY_RBAC_ROLE_MAP`` is set to a JSON object mapping OBO role
+      names to PostgreSQL roles (e.g. ``{"finance_analyst": "aether_finance_ro"}``), or
+    - ``AUTO_ONTOLOGY_ENABLE_RBAC_SET_ROLE`` is truthy (``1``, ``true``, ``yes``, ``on``),
+      mapping the first OBO role via ``AUTO_ONTOLOGY_RBAC_ROLE_PREFIX`` (default
+      ``aether_role_``).
+
+    Every resolved role is validated against ``^[a-z_][a-z0-9_]*$`` fail-closed
+    so untrusted claim values can never inject arbitrary SQL into ``SET LOCAL ROLE``.
+    """
+    obo = resolve_effective_obo(obo_context)
+    if obo is None or not obo.roles:
+        return None
+
+    raw_map = (os.environ.get("AUTO_ONTOLOGY_RBAC_ROLE_MAP") or "").strip()
+    candidate: str | None = None
+    if raw_map:
+        parsed = json.loads(raw_map)
+        if not isinstance(parsed, dict):
+            raise ValueError("AUTO_ONTOLOGY_RBAC_ROLE_MAP must be a JSON object")
+        for role in obo.roles:
+            mapped = parsed.get(role)
+            if isinstance(mapped, str) and mapped.strip():
+                candidate = mapped.strip()
+                break
+    else:
+        enabled = (os.environ.get("AUTO_ONTOLOGY_ENABLE_RBAC_SET_ROLE") or "").strip().lower()
+        if enabled in {"1", "true", "yes", "on"}:
+            role_prefix = (
+                os.environ.get("AUTO_ONTOLOGY_RBAC_ROLE_PREFIX") or "aether_role_"
+            ).strip()
+            candidate = f"{role_prefix}{obo.roles[0].strip().lower()}"
+
+    if candidate is None:
+        return None
+    if not _IDENT_RE.match(candidate):
+        raise ValueError(
+            f"Invalid PostgreSQL RBAC role identifier {candidate!r}: must match [a-z_][a-z0-9_]*"
+        )
+    return candidate
+
+
 def snowflake_query_tag(obo_context: CallerOboContext | None = None) -> str | None:
     """Serialize caller identity as a Snowflake ``QUERY_TAG`` audit label.
 

@@ -34,6 +34,10 @@ from pathlib import Path
 DEFAULT_SPEC_PATH = Path(__file__).resolve().parent / "auto-ontology-api.json"
 
 DEFAULT_API_URL = "http://localhost:3000"
+# When AUTO_ONTOLOGY_WORKLOAD_JWT_ONLY=1 is enabled without an explicit
+# AUTO_ONTOLOGY_API_URL, target the FastAPI backend (:3001) directly because no
+# Better Auth /api/auth/oauth2/userinfo round-trip is needed.
+DEFAULT_WORKLOAD_API_URL = "http://localhost:3001"
 
 # 3000 frontend, 3001 backend, 3002 ingestion — this is the next free one.
 DEFAULT_PORT = 3003
@@ -67,6 +71,15 @@ class Settings:
     # the server names for itself is the one they dialled — so a bind address
     # that is not how anyone addresses it needs this set explicitly.
     public_url: str = ""
+    workload_jwt_secret: str = ""
+    workload_jwt_issuer: str = ""
+    workload_jwt_audience: str = ""
+    workload_jwt_only: bool = False
+
+
+def _truthy(name: str) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _positive_float(name: str, default: float) -> float:
@@ -126,7 +139,20 @@ def load_settings() -> Settings:
             "use the copy shipped with auto-ontology-mcp, or reinstall the package."
         )
 
-    api_url = (os.environ.get("AUTO_ONTOLOGY_API_URL") or DEFAULT_API_URL).strip()
+    workload_jwt_secret = (
+        os.environ.get("AUTO_ONTOLOGY_WORKLOAD_JWT_SECRET")
+        or os.environ.get("OBO_SIGNING_SECRET")
+        or ""
+    ).strip()
+    workload_jwt_only = _truthy("AUTO_ONTOLOGY_WORKLOAD_JWT_ONLY")
+    if workload_jwt_only and not workload_jwt_secret:
+        raise ConfigError(
+            "AUTO_ONTOLOGY_WORKLOAD_JWT_ONLY requires "
+            "AUTO_ONTOLOGY_WORKLOAD_JWT_SECRET to be set."
+        )
+
+    default_api_url = DEFAULT_WORKLOAD_API_URL if workload_jwt_only else DEFAULT_API_URL
+    api_url = (os.environ.get("AUTO_ONTOLOGY_API_URL") or default_api_url).strip()
     host = (os.environ.get("AUTO_ONTOLOGY_MCP_HOST") or DEFAULT_HOST).strip()
     port = _port("AUTO_ONTOLOGY_MCP_PORT", DEFAULT_PORT)
 
@@ -141,6 +167,14 @@ def load_settings() -> Settings:
             "AUTO_ONTOLOGY_MCP_CHAT_TIMEOUT_S", DEFAULT_CHAT_TIMEOUT_S
         ),
         public_url=_public_url(host, port),
+        workload_jwt_secret=workload_jwt_secret,
+        workload_jwt_issuer=(
+            os.environ.get("AUTO_ONTOLOGY_WORKLOAD_JWT_ISSUER") or ""
+        ).strip(),
+        workload_jwt_audience=(
+            os.environ.get("AUTO_ONTOLOGY_WORKLOAD_JWT_AUDIENCE") or ""
+        ).strip(),
+        workload_jwt_only=workload_jwt_only,
     )
 
 

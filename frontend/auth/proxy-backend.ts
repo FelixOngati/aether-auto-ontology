@@ -13,7 +13,8 @@
 // authorization boundary, so the backend's own `zone_ids` default (unscoped)
 // is what every proxied call gets.
 
-import { buildInternalIdentityHeaders } from '@/lib/internalIdentity';
+import { verifyWorkloadJwt } from './workload-jwt';
+import { buildGatewaySecretHeaders, buildInternalIdentityHeaders } from '../lib/internalIdentity';
 
 const PYTHON_API_URL = process.env.PYTHON_API_URL ?? 'http://127.0.0.1:3001';
 
@@ -48,10 +49,26 @@ export async function proxyToBackend(
 	const incoming = new URL(req.url);
 	const target = `${PYTHON_API_URL}${incoming.pathname}${incoming.search}`;
 
-	const headers: Record<string, string> = { Accept: 'application/json' };
+	const headers: Record<string, string> = {
+		Accept: 'application/json',
+		...buildGatewaySecretHeaders(),
+	};
 	const contentType = req.headers.get('content-type');
 	if (contentType) headers['Content-Type'] = contentType;
-	if (userId) Object.assign(headers, buildInternalIdentityHeaders(userId));
+
+	const workload = await verifyWorkloadJwt(req.headers);
+	if (workload) {
+		headers.Authorization = `Bearer ${workload.token}`;
+		Object.assign(
+			headers,
+			buildInternalIdentityHeaders(userId ?? workload.subject, {
+				tenantId: workload.tenantId,
+				abac: workload.abac,
+			}),
+		);
+	} else if (userId) {
+		Object.assign(headers, buildInternalIdentityHeaders(userId));
+	}
 
 	const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
 	const body = hasBody ? await req.text() : undefined;

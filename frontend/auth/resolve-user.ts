@@ -22,23 +22,39 @@ import { getCurrentSession } from '@/auth/auth-guards';
 import { extractApiToken, verifyApiToken } from '@/auth/api-token';
 import { extractOAuthToken, verifyOAuthToken } from '@/auth/oauth-token';
 import { verifyBearer } from '@/auth/bearer';
+import { isWorkloadJwtCandidate, isWorkloadJwtOnly, verifyWorkloadJwt } from '@/auth/workload-jwt';
 import { getPrisma } from '@/lib/prisma';
 
-export type ResolvedUser = { id: string; role: string | null };
+export type ResolvedUser = {
+	id: string;
+	role: string | null;
+	tenantId?: string;
+	abac?: Record<string, unknown>;
+};
 
 /**
  * Resolve the Auto Ontology user behind the current request — from the session cookie, a
- * Auto Ontology API token, a Auto Ontology-issued OAuth access token, or a verified SSO bearer token
- * (matched by email, then by SSO account subject). Returns null when the caller
- * is unauthenticated or has no matching Auto Ontology user. This is the single entry point
- * browser, script, and service callers all go through, so every protected API
- * accepts any of the four credentials.
+ * Auto Ontology API token, a Auto Ontology-issued OAuth access token, a signed workload OBO JWT,
+ * or a verified SSO bearer token (matched by email, then by SSO account subject).
+ * Returns null when the caller is unauthenticated or has no matching Auto Ontology user.
  */
 export async function resolveUser(): Promise<ResolvedUser | null> {
+	const requestHeaders = await headers();
+
+	if (isWorkloadJwtOnly()) {
+		const workload = await verifyWorkloadJwt(requestHeaders);
+		return workload
+			? {
+					id: workload.subject,
+					role: workload.role,
+					tenantId: workload.tenantId,
+					abac: workload.abac,
+				}
+			: null;
+	}
+
 	const session = await getCurrentSession();
 	if (session?.user.id) return { id: session.user.id, role: session.user.role ?? null };
-
-	const requestHeaders = await headers();
 
 	// A Auto Ontology token is unambiguous, so presenting one settles which credential is
 	// being offered: a revoked or expired token is a 401, not an invitation to
@@ -49,6 +65,20 @@ export async function resolveUser(): Promise<ResolvedUser | null> {
 	// Likewise settled by shape: an opaque bearer cannot be an SSO id token, so
 	// there is nothing to fall through to.
 	if (extractOAuthToken(requestHeaders)) return verifyOAuthToken(requestHeaders);
+
+	// Signed HS256 workload OBO JWTs settle here without requiring a Prisma user
+	// row; forged or expired HS256 tokens fail closed with 401.
+	if (isWorkloadJwtCandidate(requestHeaders)) {
+		const workload = await verifyWorkloadJwt(requestHeaders);
+		return workload
+			? {
+					id: workload.subject,
+					role: workload.role,
+					tenantId: workload.tenantId,
+					abac: workload.abac,
+				}
+			: null;
+	}
 
 	const principal = await verifyBearer(requestHeaders);
 	if (!principal) return null;

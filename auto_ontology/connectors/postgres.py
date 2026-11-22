@@ -25,7 +25,13 @@ from auto_ontology.server.identity import CallerOboContext
 
 
 def _reset_pooled_connection(conn: psycopg.Connection) -> None:
-    """Clear all session state, temp objects, and GUCs before returning *conn* to the pool."""
+    """Roll back, then clear session state before *conn* returns to the pool.
+
+    ``DISCARD ALL`` fails inside an open transaction. A canceled caller query
+    can hand the connection back still in that transaction, so the reset rolls
+    back first and then drops roles, GUCs, and temp objects.
+    """
+    conn.rollback()
     conn.execute("DISCARD ALL")
 
 
@@ -149,7 +155,8 @@ class PostgresDatabase(SQLDatabase):
                         conn.execute(
                             "SELECT "
                             + ", ".join(
-                                f"set_config('{name}', %s, true)" for name, _ in settings
+                                f"set_config('{name}', %s, true)"
+                                for name, _ in settings
                             ),
                             tuple(value for _, value in settings),
                         )

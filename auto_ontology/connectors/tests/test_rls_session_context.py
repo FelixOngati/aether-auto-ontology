@@ -19,12 +19,14 @@ from auto_ontology.connectors.postgres import PostgresDatabase, _reset_pooled_co
 from auto_ontology.semantic.visit_enter import execute_capped
 from auto_ontology.connectors.session_context import (
     MissingCallerContextError,
+    UnmappedRbacRoleError,
     mysql_session_variables,
     postgres_rbac_role,
     postgres_rls_settings,
     require_postgres_tenant_guc,
     rls_guc_prefix,
     snowflake_query_tag,
+    validate_rbac_configuration,
 )
 from auto_ontology.connectors.snowflake import SnowflakeDatabase
 from auto_ontology.retrieval.text_to_sql.react.run_sql import (
@@ -248,6 +250,9 @@ def test_patch5_rbac_set_local_role_discard_all_and_sqlglot_guards(
         def execute(self, sql: str, params: Any = None) -> None:
             executed.append((sql, params))
 
+        def rollback(self) -> None:
+            executed.append(("ROLLBACK", None))
+
         def cursor(self, **kwargs: Any) -> _FakeCursor:
             return _FakeCursor()
 
@@ -267,10 +272,10 @@ def test_patch5_rbac_set_local_role_discard_all_and_sqlglot_guards(
         def close(self) -> None:
             self.closed = True
 
-    # 1. Pool reset hook executes DISCARD ALL
+    # 1. Pool reset rolls back an open transaction, then DISCARD ALL.
     reset_conn = _FakeConn()
     _reset_pooled_connection(reset_conn)  # type: ignore[arg-type]
-    assert executed == [("DISCARD ALL", None)]
+    assert executed == [("ROLLBACK", None), ("DISCARD ALL", None)]
     executed.clear()
 
     # 2. SET LOCAL ROLE from verified OBO role map + fail-closed identifier validation
@@ -314,15 +319,80 @@ def test_patch5_rbac_set_local_role_discard_all_and_sqlglot_guards(
     assert check_sql("COPY invoices TO '/tmp/out.csv'", "postgres", cat).problems
     assert check_sql("GRANT SELECT ON invoices TO public", "postgres", cat).problems
     assert check_sql("SELECT * FROM pg_catalog.pg_tables", "postgres", cat).problems
-    assert check_sql("SELECT * FROM information_schema.columns", "postgres", cat).problems
+    assert check_sql(
+        "SELECT * FROM information_schema.columns", "postgres", cat
+    ).problems
     assert check_sql("SELECT * FROM pg_shadow", "postgres", cat).problems
     assert not check_sql("SELECT id, amount FROM invoices", "postgres", cat).problems
 
     monkeypatch.setenv("AUTO_ONTOLOGY_MAX_QUERY_ROWS", "250")
-    bounded = enforce_default_row_limit("SELECT id, amount FROM invoices", dialect="postgres")
+    bounded = enforce_default_row_limit(
+        "SELECT id, amount FROM invoices", dialect="postgres"
+    )
     assert "LIMIT 250" in bounded.upper()
     already_bounded = enforce_default_row_limit(
         "SELECT id FROM invoices LIMIT 10", dialect="postgres"
     )
     assert "LIMIT 10" in already_bounded.upper()
     assert "250" not in already_bounded
+    clamped = enforce_default_row_limit(
+        "SELECT id FROM invoices LIMIT 100000000", dialect="postgres"
+    )
+    assert "LIMIT 250" in clamped.upper()
+    assert "100000000" not in clamped
+    monkeypatch.setenv("AUTO_ONTOLOGY_MAX_QUERY_ROWS", "0")
+    with pytest.raises(ValueError, match="positive row cap"):
+        enforce_default_row_limit("SELECT id FROM invoices", dialect="postgres")
+
+
+def test_rbac_role_is_required_when_obo_roles_are_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AUTO_ONTOLOGY_RBAC_ROLE_MAP", raising=False)
+    monkeypatch.delenv("AUTO_ONTOLOGY_ENABLE_RBAC_SET_ROLE", raising=False)
+    ctx = CallerOboContext(
+        user_id="alice@example.com",
+        tenant_id="tenant-a",
+        roles=("finance_analyst",),
+    )
+    assert postgres_rbac_role(ctx) == "aether_role_finance_analyst"
+
+    ambiguous = CallerOboContext(
+        user_id="alice@example.com",
+        tenant_id="tenant-a",
+        roles=("finance_analyst", "viewer"),
+    )
+    with pytest.raises(UnmappedRbacRoleError, match="more than one"):
+        postgres_rbac_role(ambiguous)
+
+    monkeypatch.setenv(
+        "AUTO_ONTOLOGY_RBAC_ROLE_MAP",
+        json.dumps(
+            {"finance_analyst": "aether_finance_ro", "viewer": "aether_finance_ro"}
+        ),
+    )
+    assert postgres_rbac_role(ambiguous) == "aether_finance_ro"
+    missing = CallerOboContext(
+        user_id="alice@example.com",
+        tenant_id="tenant-a",
+        roles=("finance_analyst", "auditor"),
+    )
+    with pytest.raises(UnmappedRbacRoleError, match="auditor"):
+        postgres_rbac_role(missing)
+    split = CallerOboContext(
+        user_id="alice@example.com",
+        tenant_id="tenant-a",
+        roles=("finance_analyst", "auditor"),
+    )
+    monkeypatch.setenv(
+        "AUTO_ONTOLOGY_RBAC_ROLE_MAP",
+        json.dumps(
+            {"finance_analyst": "aether_finance_ro", "auditor": "aether_audit_ro"}
+        ),
+    )
+    with pytest.raises(UnmappedRbacRoleError, match="more than one"):
+        postgres_rbac_role(split)
+
+    monkeypatch.setenv("AUTO_ONTOLOGY_RBAC_ROLE_MAP", "{")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        validate_rbac_configuration()

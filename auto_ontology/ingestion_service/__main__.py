@@ -55,6 +55,9 @@ async def lifespan(app: FastAPI):
     # not starting. Worse here than there, because a scheduler runs unattended —
     # nobody is watching a request come back 500, so the failure surfaces as an
     # empty catalog hours later.
+    from auto_ontology.connectors.session_context import validate_rbac_configuration
+
+    validate_rbac_configuration()
     require_current_schema()
 
     # uvicorn owns SIGINT/SIGTERM; each scheduler exposes a stop() that unwinds

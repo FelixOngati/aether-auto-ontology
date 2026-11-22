@@ -290,9 +290,7 @@ def find_unauthorized_system_schemas(statement: exp.Expression) -> list[str]:
         schema_low = (table.db or "").lower()
         name_low = (table.name or "").lower()
         if schema_low in _FORBIDDEN_SYSTEM_SCHEMAS or schema_low.startswith("pg_"):
-            problems.append(
-                f"Not allowed in a read query: system schema {table.db!r}"
-            )
+            problems.append(f"Not allowed in a read query: system schema {table.db!r}")
         elif name_low in _FORBIDDEN_SYSTEM_TABLES:
             problems.append(
                 f"Not allowed in a read query: system catalog table {table.name!r}"
@@ -300,24 +298,60 @@ def find_unauthorized_system_schemas(statement: exp.Expression) -> list[str]:
     return list(dict.fromkeys(problems))[:_MAX_PROBLEMS]
 
 
+def _query_row_cap(max_rows: int | None) -> int:
+    """Return the positive row ceiling. A non-positive cap is a configuration error."""
+    if max_rows is not None:
+        cap = max_rows
+    else:
+        raw = os.environ.get(
+            "AUTO_ONTOLOGY_MAX_QUERY_ROWS", str(DEFAULT_MAX_QUERY_ROWS)
+        )
+        try:
+            cap = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"AUTO_ONTOLOGY_MAX_QUERY_ROWS must be a positive integer, got {raw!r}"
+            ) from exc
+    if cap <= 0:
+        raise ValueError(
+            f"AUTO_ONTOLOGY_MAX_QUERY_ROWS must be a positive row cap, got {cap}. "
+            "A non-positive value does not disable the guard."
+        )
+    return cap
+
+
+def _limit_row_count(limit: exp.Expression | None) -> int | None:
+    """Return a literal LIMIT count, or None when the query is unbounded or opaque."""
+    if limit is None:
+        return None
+    expression = limit.expression if isinstance(limit, exp.Limit) else limit
+    if isinstance(expression, exp.Literal) and not expression.is_string:
+        try:
+            return int(expression.this)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def enforce_default_row_limit(
     sql: str,
     dialect: str | None = None,
     max_rows: int | None = None,
 ) -> str:
-    """Inject an AST-level ``LIMIT`` on unbounded SELECT queries (SRS v2.3 §5.2)."""
-    cap = (
-        max_rows
-        if max_rows is not None
-        else int(os.environ.get("AUTO_ONTOLOGY_MAX_QUERY_ROWS", str(DEFAULT_MAX_QUERY_ROWS)))
-    )
-    if cap <= 0:
-        return sql
+    """Clamp a read query to the SRS §5.2 row ceiling.
+
+    A missing LIMIT is added. A LIMIT above the cap, or a LIMIT that is not a
+    plain integer, is replaced with the cap. A LIMIT at or under the cap is
+    left as written.
+    """
+    cap = _query_row_cap(max_rows)
     parsed = sqlglot.parse_one(sql, read=dialect or None)
-    if isinstance(parsed, exp.Query) and parsed.args.get("limit") is None:
-        parsed = parsed.limit(cap)
-        return parsed.sql(dialect=dialect or None)
-    return sql
+    if not isinstance(parsed, exp.Query):
+        return sql
+    current = _limit_row_count(parsed.args.get("limit"))
+    if current is not None and current <= cap:
+        return sql
+    return parsed.limit(cap).sql(dialect=dialect or None)
 
 
 def check_sql(sql: str, dialect: str | None, catalog: CatalogNames) -> CheckResult:
@@ -331,7 +365,9 @@ def check_sql(sql: str, dialect: str | None, catalog: CatalogNames) -> CheckResu
     statement = statements[0]
     if not isinstance(statement, exp.Query):
         return CheckResult(["Only read queries (SELECT or WITH … SELECT) can run."])
-    side_effects = find_side_effects(statement) + find_unauthorized_system_schemas(statement)
+    side_effects = find_side_effects(statement) + find_unauthorized_system_schemas(
+        statement
+    )
     if side_effects:
         return CheckResult(side_effects)
     return CheckResult(find_unknown_names(statement, catalog), statement)

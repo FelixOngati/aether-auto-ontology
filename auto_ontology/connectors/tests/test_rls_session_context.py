@@ -16,6 +16,7 @@ import pytest
 
 from auto_ontology.connectors.mysql import MySQLDatabase
 from auto_ontology.connectors.postgres import PostgresDatabase
+from auto_ontology.semantic.visit_enter import execute_capped
 from auto_ontology.connectors.session_context import (
     MissingCallerContextError,
     mysql_session_variables,
@@ -151,6 +152,19 @@ def test_postgres_execute_refuses_without_a_tenant_guc() -> None:
     assert executed == []
     with pytest.raises(MissingCallerContextError):
         require_postgres_tenant_guc(None)
+
+
+def test_catalog_sampling_opts_postgres_out_of_caller_rls() -> None:
+    db = object.__new__(PostgresDatabase)
+    seen: list[dict[str, Any]] = []
+
+    def execute(sql: str, parameters: Any = None, **kwargs: Any) -> pd.DataFrame:
+        seen.append(kwargs)
+        return pd.DataFrame()
+
+    db.execute = execute  # type: ignore[method-assign]
+    execute_capped(db, "SELECT 1")
+    assert seen == [{"timeout_s": 120, "enforce_caller_rls": False}]
 
 
 def test_snowflake_query_tag_and_mysql_variables_are_not_row_filters() -> None:

@@ -99,5 +99,11 @@ def test_ask_question_forwards_target_db_and_populates_provenance_and_blob_ref(
     assert res.data.newly_ingested_columns == ["sales.orders.discount_tier"]
     assert res.data.blob_ref is not None
     assert res.data.blob_ref.row_count == 135
-    stored_path = Path(res.data.blob_ref.uri.removeprefix("file://"))
-    assert len(json.loads(stored_path.read_text(encoding="utf-8"))) == 135
+    rendered = res.content[0].text
+    assert "file://" not in rendered
+    assert str(tmp_path) not in rendered
+    assert res.data.blob_ref.id == res.data.blob_ref.sha256
+    stored = list(tmp_path.rglob("*.json"))
+    assert len(stored) == 1
+    assert stored[0].parent.name == "warehouse_prod"
+    assert len(json.loads(stored[0].read_text(encoding="utf-8"))) == 135

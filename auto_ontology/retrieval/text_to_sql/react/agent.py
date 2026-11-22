@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import sqlglot
 from langchain_core.messages import AIMessage
+from sqlglot import exp
 
 from auto_ontology.retrieval.text_to_sql.base import BaseAgent, record_thought
 from auto_ontology.retrieval.text_to_sql.models import SQLGenerationModel
@@ -52,12 +54,11 @@ def _extract_executed_queries(
     return seen
 
 
-def _extract_table_governance(
+def _catalog_columns(
     tables: list[dict[str, Any]],
-) -> tuple[list[str], dict[str, list[str]], list[str]]:
-    referenced_columns: list[str] = []
-    pii_tags: dict[str, list[str]] = {}
-    newly_ingested_columns: list[str] = []
+) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+    """Return ``(table, column, qualified_name)`` for catalog columns."""
+    found: list[tuple[dict[str, Any], dict[str, Any], str]] = []
     for tbl in tables:
         if not isinstance(tbl, dict):
             continue
@@ -71,19 +72,85 @@ def _extract_table_governance(
             if not col_name:
                 continue
             qualified = f"{prefix}.{col_name}" if prefix else col_name
-            if qualified not in referenced_columns:
-                referenced_columns.append(qualified)
+            found.append((tbl, col, qualified))
+    return found
+
+
+def _statement_column_names(sql: str, dialect: str | None) -> set[str] | None:
+    """Column names used by *sql*, or every column of its tables when it stars.
+
+    ``None`` means the statement did not parse. ``COUNT(*)`` does not name a
+    column. A bare ``SELECT *`` returns ``{"*"}`` so the caller expands the
+    tables that appear in the statement.
+    """
+    try:
+        parsed = sqlglot.parse_one(sql, read=dialect or None)
+    except sqlglot.errors.SqlglotError:
+        return None
+    names: set[str] = set()
+    for column in parsed.find_all(exp.Column):
+        if column.name:
+            names.add(column.name.casefold())
+    for star in parsed.find_all(exp.Star):
+        if isinstance(star.parent, exp.Count):
+            continue
+        names.add("*")
+    return names
+
+
+def _statement_table_names(sql: str, dialect: str | None) -> set[str] | None:
+    try:
+        parsed = sqlglot.parse_one(sql, read=dialect or None)
+    except sqlglot.errors.SqlglotError:
+        return None
+    names: set[str] = set()
+    for table in parsed.find_all(exp.Table):
+        if table.name:
+            names.add(table.name.casefold())
+    return names
+
+
+def _governance_from_queries(
+    queries: list[str],
+    tables: list[dict[str, Any]],
+    dialect: str | None,
+) -> tuple[list[str], dict[str, list[str]] | None, list[str]]:
+    """PII and column lists for columns that appear in *queries*.
+
+    Columns the agent only opened in the catalog are omitted. A selected
+    column with no catalog classification is omitted from the PII map, and
+    the map itself is ``None`` when no referenced column is classified.
+    """
+    catalog = _catalog_columns(tables)
+    referenced: list[str] = []
+    pii_tags: dict[str, list[str]] = {}
+    newly_ingested: list[str] = []
+    for sql in queries:
+        column_names = _statement_column_names(sql, dialect)
+        table_names = _statement_table_names(sql, dialect)
+        if column_names is None or table_names is None:
+            continue
+        expand_star = "*" in column_names
+        for tbl, col, qualified in catalog:
+            table_name = str(tbl.get("table_name") or tbl.get("name") or "").casefold()
+            if table_names and table_name not in table_names:
+                continue
+            col_name = str(col.get("column_name") or col.get("name") or "")
+            if not expand_star and col_name.casefold() not in column_names:
+                continue
+            if qualified not in referenced:
+                referenced.append(qualified)
             raw_tags = col.get("pii_tags") or col.get("tags") or []
-            if isinstance(raw_tags, list):
-                tags = [str(t) for t in raw_tags if str(t).strip()]
-                if tags:
-                    pii_tags[qualified] = tags
-            if (
-                col.get("newly_ingested") is True
-                and qualified not in newly_ingested_columns
-            ):
-                newly_ingested_columns.append(qualified)
-    return referenced_columns, pii_tags, newly_ingested_columns
+            tags = (
+                [str(tag) for tag in raw_tags if str(tag).strip()]
+                if isinstance(raw_tags, list)
+                else []
+            )
+            if tags:
+                pii_tags[qualified] = tags
+            if col.get("newly_ingested") is True and qualified not in newly_ingested:
+                newly_ingested.append(qualified)
+    return referenced, pii_tags or None, newly_ingested
 
 
 def _tool_thought(call: dict[str, Any]) -> str:
@@ -154,9 +221,18 @@ class ReactSQLAgent(BaseAgent):
         path_state["react_end_reason"] = result.reason
         relevant_tables = list(ctx.seen_tables.values())
         path_state["relevant_tables"] = relevant_tables
-        ref_cols, pii_map, new_cols = _extract_table_governance(relevant_tables)
+        dialect = getattr(connector, "dialect", None)
+        provisional_sql = ""
+        if result.submission is not None:
+            provisional_sql = result.submission.sql
+        queries = _extract_executed_queries(result.trajectory, provisional_sql)
+        ref_cols, pii_map, new_cols = _governance_from_queries(
+            queries, relevant_tables, dialect
+        )
         path_state["referenced_columns"] = ref_cols
-        path_state["pii_tags"] = pii_map
+        path_state.pop("pii_tags", None)
+        if pii_map:
+            path_state["pii_tags"] = pii_map
         path_state["newly_ingested_columns"] = new_cols
 
         if result.prediction is not None:

@@ -85,11 +85,14 @@ class ResponseAgent(BaseAgent):
                 path_state.get("executed_queries") or ([sql_code] if sql_code else [])
             ),
             "referenced_columns": list(path_state.get("referenced_columns") or []),
-            "pii_tags": dict(path_state.get("pii_tags") or {}),
             "newly_ingested_columns": list(
                 path_state.get("newly_ingested_columns") or []
             ),
         }
+
+        classified = path_state.get("pii_tags")
+        if isinstance(classified, dict) and classified:
+            response["pii_tags"] = dict(classified)
 
         self.logger.info("Calculation response prepared and returned")
 

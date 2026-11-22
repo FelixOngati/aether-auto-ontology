@@ -22,8 +22,8 @@ def test_react_and_response_agents_propagate_sql_and_column_provenance(
 ) -> None:
     db_response = QueryResponse(result=['[{"total": 250.0}]'], sliced=False)
     submission = Submission(
-        "SELECT SUM(amount) AS total FROM public.invoices",
-        "Total invoice amount is 250.0.",
+        "SELECT billing_email, status FROM public.invoices",
+        "Invoice contacts.",
         "",
         db_response,
     )
@@ -40,7 +40,9 @@ def test_react_and_response_agents_propagate_sql_and_column_provenance(
                 },
                 {
                     "name": "submit",
-                    "args": {"sql": "SELECT SUM(amount) AS total FROM public.invoices"},
+                    "args": {
+                        "sql": "SELECT billing_email, status FROM public.invoices"
+                    },
                 },
             ],
         }
@@ -54,9 +56,15 @@ def test_react_and_response_agents_propagate_sql_and_column_provenance(
             "table_name": "invoices",
             "columns": [
                 {"column_name": "amount", "newly_ingested": False},
+                {"column_name": "status"},
                 {
                     "column_name": "billing_email",
                     "pii_tags": ["EMAIL"],
+                    "newly_ingested": True,
+                },
+                {
+                    "column_name": "ssn",
+                    "pii_tags": ["SSN"],
                     "newly_ingested": True,
                 },
             ],
@@ -83,11 +91,32 @@ def test_react_and_response_agents_propagate_sql_and_column_provenance(
     assert final["target_db"] == "erp"
     assert final["executed_queries"] == [
         "SELECT COUNT(*) FROM public.invoices",
-        "SELECT SUM(amount) AS total FROM public.invoices",
+        "SELECT billing_email, status FROM public.invoices",
     ]
     assert final["referenced_columns"] == [
-        "public.invoices.amount",
+        "public.invoices.status",
         "public.invoices.billing_email",
     ]
     assert final["pii_tags"] == {"public.invoices.billing_email": ["EMAIL"]}
+    assert "public.invoices.ssn" not in final["referenced_columns"]
     assert final["newly_ingested_columns"] == ["public.invoices.billing_email"]
+
+
+def test_unclassified_columns_leave_the_pii_map_absent() -> None:
+    referenced, pii, newly = agent_module._governance_from_queries(
+        ["SELECT amount FROM public.invoices"],
+        [
+            {
+                "schema_name": "public",
+                "table_name": "invoices",
+                "columns": [
+                    {"column_name": "amount"},
+                    {"column_name": "billing_email", "pii_tags": ["EMAIL"]},
+                ],
+            }
+        ],
+        "postgres",
+    )
+    assert referenced == ["public.invoices.amount"]
+    assert pii is None
+    assert newly == []

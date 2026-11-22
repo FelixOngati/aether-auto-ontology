@@ -21,14 +21,18 @@ and the rows without parsing prose.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 
 from auto_ontology_mcp.config import Settings
 
@@ -38,9 +42,24 @@ logger = logging.getLogger(__name__)
 # of rows. Return a readable prefix and say how much was withheld, rather than
 # flooding the caller or silently truncating.
 MAX_ROWS = 100
+_BLOB_TTL = timedelta(hours=1)
 
 _SSE_DATA_PREFIX = "data:"
 _SSE_DONE = "[DONE]"
+
+
+class BlobRef(BaseModel):
+    """Opaque handle for a full row payload kept on the server."""
+
+    id: str = Field(
+        description="Opaque id of the stored payload. Not a filesystem path."
+    )
+    sha256: str = Field(description="Hex SHA-256 digest of the stored JSON bytes.")
+    size_bytes: int = Field(description="Byte length of the stored JSON payload.")
+    row_count: int = Field(description="Total number of rows stored in the blob.")
+    expires_at: str = Field(
+        description="UTC time after which the server deletes the payload."
+    )
 
 
 class DataAnswer(BaseModel):
@@ -62,6 +81,40 @@ class DataAnswer(BaseModel):
         default="",
         description="What the agent did, one line per step it took.",
     )
+    target_db: str | None = Field(
+        default=None,
+        description="Connected database pinned for this question, if specified.",
+    )
+    executed_queries: list[str] = Field(
+        default_factory=list,
+        description="Ordered SQL statements executed during the episode.",
+    )
+    referenced_columns: list[str] = Field(
+        default_factory=list,
+        description="Qualified columns inspected during semantic retrieval.",
+    )
+    pii_tags: dict[str, list[str]] | None = Field(
+        default=None,
+        description=(
+            "Catalog PII tags for columns in the executed SQL. Absent when "
+            "the catalog has no classification for those columns."
+        ),
+    )
+    newly_ingested_columns: list[str] = Field(
+        default_factory=list,
+        description="Referenced columns flagged as newly ingested.",
+    )
+    blob_ref: BlobRef | None = Field(
+        default=None,
+        description="Opaque server-side handle for the full row payload when truncated.",
+    )
+
+    @model_serializer(mode="wrap")
+    def _omit_unclassified_pii(self, handler):
+        payload = handler(self)
+        if isinstance(payload, dict) and payload.get("pii_tags") is None:
+            payload.pop("pii_tags", None)
+        return payload
 
 
 def _parse_rows(raw: Any) -> list[dict[str, Any]]:
@@ -87,18 +140,112 @@ def _parse_rows(raw: Any) -> list[dict[str, Any]]:
     return [row for row in raw if isinstance(row, dict)]
 
 
-def _build_answer(payload: dict[str, Any]) -> DataAnswer:
+def _blob_scope(scope: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in scope.strip())
+    return cleaned or "unscoped"
+
+
+def _purge_expired_blobs(root: Path, now: float) -> None:
+    if not root.exists():
+        return
+    cutoff = now - _BLOB_TTL.total_seconds()
+    for path in root.rglob("*.json"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            logger.warning("Could not expire blob %s", path.name)
+
+
+def _write_blob_if_needed(
+    rows: list[dict[str, Any]],
+    blob_store_dir: Path | None,
+    *,
+    scope: str,
+) -> BlobRef | None:
+    """Store oversized rows on the server and return an opaque id.
+
+    The tool result never includes a filesystem path. The file lives under a
+    scope directory (tenant or target database) and is deleted after
+    ``_BLOB_TTL``.
+    """
+    if len(rows) <= MAX_ROWS or blob_store_dir is None:
+        return None
+    now = time.time()
+    _purge_expired_blobs(blob_store_dir, now)
+    directory = blob_store_dir / _blob_scope(scope)
+    directory.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(rows, separators=(",", ":"), default=str).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    (directory / f"{digest}.json").write_bytes(raw)
+    expires = datetime.fromtimestamp(now, tz=timezone.utc) + _BLOB_TTL
+    return BlobRef(
+        id=digest,
+        sha256=digest,
+        size_bytes=len(raw),
+        row_count=len(rows),
+        expires_at=expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+
+def _build_answer(
+    payload: dict[str, Any],
+    *,
+    requested_target_db: str | None = None,
+    streamed_queries: list[str] | None = None,
+    blob_store_dir: Path | None = None,
+) -> DataAnswer:
     # A successful run reports rows under `sql_response_from_db`. `result` is
     # only present in the failure shape `_extract_answer` falls back to, where
     # it is None — so reading it first would discard every real answer.
     rows = _parse_rows(payload.get("sql_response_from_db") or payload.get("result"))
+    sql_code = str(payload.get("sql_code") or "")
+    queries: list[str] = []
+    for candidate in [
+        *(streamed_queries or []),
+        *(payload.get("executed_queries") or []),
+        sql_code,
+    ]:
+        cleaned = str(candidate or "").strip()
+        if cleaned and cleaned not in queries:
+            queries.append(cleaned)
+
+    raw_pii = payload.get("pii_tags")
+    pii_tags: dict[str, list[str]] | None = None
+    if isinstance(raw_pii, dict):
+        parsed = {
+            str(col): [str(t) for t in tags if str(t).strip()]
+            for col, tags in raw_pii.items()
+            if isinstance(tags, list)
+        }
+        parsed = {col: tags for col, tags in parsed.items() if tags}
+        if parsed:
+            pii_tags = parsed
+    scope = str(
+        payload.get("tenant_id")
+        or requested_target_db
+        or payload.get("target_db")
+        or ""
+    )
     return DataAnswer(
         answer=str(payload.get("response") or ""),
-        sql=str(payload.get("sql_code") or ""),
+        sql=sql_code,
         rows=rows[:MAX_ROWS],
         row_count=len(rows),
         truncated=len(rows) > MAX_ROWS,
         reasoning=str(payload.get("thoughts") or ""),
+        target_db=str(payload.get("target_db") or requested_target_db or "") or None,
+        executed_queries=queries,
+        referenced_columns=[
+            str(c) for c in (payload.get("referenced_columns") or []) if str(c).strip()
+        ],
+        pii_tags=pii_tags,
+        newly_ingested_columns=[
+            str(c)
+            for c in (payload.get("newly_ingested_columns") or [])
+            if str(c).strip()
+        ],
+        blob_ref=_write_blob_if_needed(rows, blob_store_dir, scope=scope),
     )
 
 
@@ -168,13 +315,9 @@ def register(mcp: FastMCP, settings: Settings, client: httpx.AsyncClient) -> Non
         ctx: Context,
         conversation_id: str | None = None,
         evidence: str | None = None,
+        target_db: str | None = None,
     ) -> DataAnswer:
         """Run one text-to-SQL turn and return its structured result.
-
-        The API also accepts ``target_db`` to pin retrieval to one database.
-        It is not exposed here: it exists for benchmarking, the web UI never
-        sends it, and letting the deployment choose is what the semantic layer
-        is for.
 
         Args:
             question: The question, in plain language.
@@ -184,14 +327,19 @@ def register(mcp: FastMCP, settings: Settings, client: httpx.AsyncClient) -> Non
                 question while the first is still running.
             evidence: Optional authoritative evidence supplied separately
                 from the question.
+            target_db: Optional catalog database name or UUID to pin retrieval
+                and SQL execution to a single connected database.
         """
         body: dict[str, Any] = {"question": question}
         if conversation_id:
             body["conversation_id"] = conversation_id
         if evidence:
             body["evidence"] = evidence
+        if target_db and target_db.strip():
+            body["target_db"] = target_db.strip()
 
         answer: DataAnswer | None = None
+        streamed_queries: list[str] = []
         steps = 0
 
         try:
@@ -220,8 +368,17 @@ def register(mcp: FastMCP, settings: Settings, client: httpx.AsyncClient) -> Non
                             progress=steps,
                             message=f"{label}: {thought}" if thought else str(label),
                         )
+                    elif kind == "sql":
+                        sql_stmt = str(event.get("sql") or "").strip()
+                        if sql_stmt and sql_stmt not in streamed_queries:
+                            streamed_queries.append(sql_stmt)
                     elif kind == "result":
-                        answer = _build_answer(event.get("answer") or {})
+                        answer = _build_answer(
+                            event.get("answer") or {},
+                            requested_target_db=target_db,
+                            streamed_queries=streamed_queries,
+                            blob_store_dir=settings.blob_store_dir,
+                        )
                     elif kind == "error":
                         raise ToolError(
                             f"Auto Ontology agent failed: {event.get('message') or 'unknown'}"
@@ -246,4 +403,4 @@ def register(mcp: FastMCP, settings: Settings, client: httpx.AsyncClient) -> Non
         return answer
 
 
-__all__ = ["DataAnswer", "MAX_ROWS", "register"]
+__all__ = ["BlobRef", "DataAnswer", "MAX_ROWS", "register"]

@@ -75,6 +75,7 @@ class Settings:
     workload_jwt_issuer: str = ""
     workload_jwt_audience: str = ""
     workload_jwt_only: bool = False
+    blob_store_dir: Path | None = None
 
 
 def _truthy(name: str) -> bool:
@@ -175,6 +176,15 @@ def load_settings() -> Settings:
             os.environ.get("AUTO_ONTOLOGY_WORKLOAD_JWT_AUDIENCE") or ""
         ).strip(),
         workload_jwt_only=workload_jwt_only,
+        blob_store_dir=(
+            Path(raw_blob_dir)
+            if (
+                raw_blob_dir := (
+                    os.environ.get("AUTO_ONTOLOGY_BLOB_STORE_DIR") or ""
+                ).strip()
+            )
+            else None
+        ),
     )
 
 

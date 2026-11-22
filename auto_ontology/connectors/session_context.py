@@ -33,6 +33,13 @@ class MissingCallerContextError(PermissionError):
     """Caller-facing SQL was asked to run without a tenant RLS binding."""
 
 
+class UnmappedRbacRoleError(PermissionError):
+    """OBO roles were present and did not resolve to one PostgreSQL role."""
+
+
+_role_map_cache: tuple[str, dict[str, str] | None] | None = None
+
+
 def resolve_effective_obo(
     obo_context: CallerOboContext | None = None,
 ) -> CallerOboContext | None:
@@ -92,6 +99,113 @@ def require_postgres_tenant_guc(
             "The pool role is not a substitute for caller row-level security."
         )
     return settings
+
+
+def _rbac_role_prefix() -> str:
+    prefix = (
+        os.environ.get("AUTO_ONTOLOGY_RBAC_ROLE_PREFIX") or "aether_role_"
+    ).strip()
+    if not _IDENT_RE.match(prefix):
+        raise ValueError(
+            f"Invalid AUTO_ONTOLOGY_RBAC_ROLE_PREFIX {prefix!r}: "
+            "must match [a-z_][a-z0-9_]*"
+        )
+    return prefix
+
+
+def _parse_rbac_role_map(raw: str) -> dict[str, str] | None:
+    """Parse ``AUTO_ONTOLOGY_RBAC_ROLE_MAP``. An empty value means prefix mapping."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "AUTO_ONTOLOGY_RBAC_ROLE_MAP is not valid JSON. "
+            "Fix it before serving queries; the pool login is not a fallback role."
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("AUTO_ONTOLOGY_RBAC_ROLE_MAP must be a JSON object")
+    cleaned: dict[str, str] = {}
+    for key, value in parsed.items():
+        if not isinstance(key, str) or not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                "AUTO_ONTOLOGY_RBAC_ROLE_MAP values must be non-empty PostgreSQL role names"
+            )
+        role = value.strip()
+        if not _IDENT_RE.match(role):
+            raise ValueError(
+                f"Invalid PostgreSQL RBAC role identifier {role!r}: "
+                "must match [a-z_][a-z0-9_]*"
+            )
+        cleaned[key] = role
+    return cleaned
+
+
+def rbac_role_map() -> dict[str, str] | None:
+    """Return the validated role map, parsing it once per distinct env value."""
+    global _role_map_cache
+    raw = (os.environ.get("AUTO_ONTOLOGY_RBAC_ROLE_MAP") or "").strip()
+    if _role_map_cache is not None and _role_map_cache[0] == raw:
+        return _role_map_cache[1]
+    parsed = _parse_rbac_role_map(raw)
+    _role_map_cache = (raw, parsed)
+    return parsed
+
+
+def validate_rbac_configuration() -> None:
+    """Fail process startup when the RBAC map or role prefix cannot be used."""
+    rbac_role_map()
+    _rbac_role_prefix()
+
+
+def postgres_rbac_role(obo_context: CallerOboContext | None = None) -> str | None:
+    """Resolve the transaction-local PostgreSQL role for a caller query.
+
+    When the caller has OBO roles, this always returns one PostgreSQL role.
+    ``AUTO_ONTOLOGY_RBAC_ROLE_MAP`` names that role explicitly. Every OBO role
+    must appear in the map, and they must all name the same PostgreSQL role,
+    so claim order cannot pick a privilege. With no map, each OBO role is
+    prefixed with ``AUTO_ONTOLOGY_RBAC_ROLE_PREFIX`` (default ``aether_role_``).
+    ``AUTO_ONTOLOGY_ENABLE_RBAC_SET_ROLE`` does not turn this off.
+
+    A missing or ambiguous mapping raises :class:`UnmappedRbacRoleError`
+    instead of leaving the statement on the pool login. Role strings are
+    checked against ``^[a-z_][a-z0-9_]*$`` before they are interpolated into
+    ``SET LOCAL ROLE``.
+    """
+    obo = resolve_effective_obo(obo_context)
+    if obo is None or not obo.roles:
+        return None
+
+    mapping = rbac_role_map()
+    if mapping is not None:
+        missing = [role for role in obo.roles if role not in mapping]
+        if missing:
+            raise UnmappedRbacRoleError(
+                "Refusing to run SQL as the pool login. "
+                f"OBO roles {list(missing)} are not in AUTO_ONTOLOGY_RBAC_ROLE_MAP."
+            )
+        resolved = [mapping[role] for role in obo.roles]
+    else:
+        prefix = _rbac_role_prefix()
+        resolved = []
+        for role in obo.roles:
+            candidate = f"{prefix}{role.strip().lower()}"
+            if not _IDENT_RE.match(candidate):
+                raise ValueError(
+                    f"Invalid PostgreSQL RBAC role identifier {candidate!r}: "
+                    "must match [a-z_][a-z0-9_]*"
+                )
+            resolved.append(candidate)
+
+    unique = list(dict.fromkeys(resolved))
+    if len(unique) != 1:
+        raise UnmappedRbacRoleError(
+            "Refusing to run SQL as the pool login. "
+            "OBO roles map to more than one PostgreSQL role."
+        )
+    return unique[0]
 
 
 def snowflake_query_tag(obo_context: CallerOboContext | None = None) -> str | None:

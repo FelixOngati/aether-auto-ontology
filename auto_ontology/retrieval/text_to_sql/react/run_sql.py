@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import difflib
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -51,17 +52,51 @@ _MAX_CELL_CHARS = 120
 
 # Nodes that write or lock even under a SELECT root: Postgres runs DML inside a
 # CTE, ``SELECT ... INTO`` creates a table, ``FOR UPDATE``/``FOR SHARE`` lock rows.
-_WRITING_NODES: tuple[type[exp.Expression], ...] = (
-    exp.Insert,
-    exp.Update,
-    exp.Delete,
-    exp.Merge,
-    exp.Create,
-    exp.Drop,
-    exp.Command,
-    exp.Into,
-    exp.Lock,
+_WRITING_NODE_NAMES: tuple[str, ...] = (
+    "Insert",
+    "Update",
+    "Delete",
+    "Merge",
+    "Create",
+    "Drop",
+    "Alter",
+    "TruncateTable",
+    "Copy",
+    "Grant",
+    "Revoke",
+    "Set",
+    "Pragma",
+    "Transaction",
+    "Commit",
+    "Rollback",
+    "Command",
+    "Into",
+    "Lock",
 )
+_WRITING_NODES: tuple[type[exp.Expression], ...] = tuple(
+    cls for name in _WRITING_NODE_NAMES if (cls := getattr(exp, name, None)) is not None
+)
+
+_FORBIDDEN_SYSTEM_SCHEMAS: frozenset[str] = frozenset(
+    {"pg_catalog", "information_schema", "pg_toast", "sys"}
+)
+_FORBIDDEN_SYSTEM_TABLES: frozenset[str] = frozenset(
+    {
+        "pg_stat_activity",
+        "pg_shadow",
+        "pg_authid",
+        "pg_roles",
+        "pg_user",
+        "pg_settings",
+        "pg_tables",
+        "pg_class",
+        "pg_attribute",
+        "pg_namespace",
+        "sqlite_master",
+        "sqlite_schema",
+    }
+)
+DEFAULT_MAX_QUERY_ROWS = 1000
 
 # A read-only transaction does not stop these: session advisory locks outlive
 # the transaction and return to the pool, backend signalling and server file
@@ -248,6 +283,77 @@ def find_side_effects(statement: exp.Expression) -> list[str]:
     return list(dict.fromkeys(problems))[:_MAX_PROBLEMS]
 
 
+def find_unauthorized_system_schemas(statement: exp.Expression) -> list[str]:
+    """Block direct enumeration of system metadata schemas/tables (SRS v2.3 §5.2)."""
+    problems: list[str] = []
+    for table in statement.find_all(exp.Table):
+        schema_low = (table.db or "").lower()
+        name_low = (table.name or "").lower()
+        if schema_low in _FORBIDDEN_SYSTEM_SCHEMAS or schema_low.startswith("pg_"):
+            problems.append(f"Not allowed in a read query: system schema {table.db!r}")
+        elif name_low in _FORBIDDEN_SYSTEM_TABLES:
+            problems.append(
+                f"Not allowed in a read query: system catalog table {table.name!r}"
+            )
+    return list(dict.fromkeys(problems))[:_MAX_PROBLEMS]
+
+
+def _query_row_cap(max_rows: int | None) -> int:
+    """Return the positive row ceiling. A non-positive cap is a configuration error."""
+    if max_rows is not None:
+        cap = max_rows
+    else:
+        raw = os.environ.get(
+            "AUTO_ONTOLOGY_MAX_QUERY_ROWS", str(DEFAULT_MAX_QUERY_ROWS)
+        )
+        try:
+            cap = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"AUTO_ONTOLOGY_MAX_QUERY_ROWS must be a positive integer, got {raw!r}"
+            ) from exc
+    if cap <= 0:
+        raise ValueError(
+            f"AUTO_ONTOLOGY_MAX_QUERY_ROWS must be a positive row cap, got {cap}. "
+            "A non-positive value does not disable the guard."
+        )
+    return cap
+
+
+def _limit_row_count(limit: exp.Expression | None) -> int | None:
+    """Return a literal LIMIT count, or None when the query is unbounded or opaque."""
+    if limit is None:
+        return None
+    expression = limit.expression if isinstance(limit, exp.Limit) else limit
+    if isinstance(expression, exp.Literal) and not expression.is_string:
+        try:
+            return int(expression.this)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def enforce_default_row_limit(
+    sql: str,
+    dialect: str | None = None,
+    max_rows: int | None = None,
+) -> str:
+    """Clamp a read query to the SRS §5.2 row ceiling.
+
+    A missing LIMIT is added. A LIMIT above the cap, or a LIMIT that is not a
+    plain integer, is replaced with the cap. A LIMIT at or under the cap is
+    left as written.
+    """
+    cap = _query_row_cap(max_rows)
+    parsed = sqlglot.parse_one(sql, read=dialect or None)
+    if not isinstance(parsed, exp.Query):
+        return sql
+    current = _limit_row_count(parsed.args.get("limit"))
+    if current is not None and current <= cap:
+        return sql
+    return parsed.limit(cap).sql(dialect=dialect or None)
+
+
 def check_sql(sql: str, dialect: str | None, catalog: CatalogNames) -> CheckResult:
     """Parse *sql*, refuse anything but one side-effect-free read, find unknown names."""
     try:
@@ -259,7 +365,9 @@ def check_sql(sql: str, dialect: str | None, catalog: CatalogNames) -> CheckResu
     statement = statements[0]
     if not isinstance(statement, exp.Query):
         return CheckResult(["Only read queries (SELECT or WITH … SELECT) can run."])
-    side_effects = find_side_effects(statement)
+    side_effects = find_side_effects(statement) + find_unauthorized_system_schemas(
+        statement
+    )
     if side_effects:
         return CheckResult(side_effects)
     return CheckResult(find_unknown_names(statement, catalog), statement)
@@ -436,10 +544,11 @@ def run_sql(ctx: ToolContext, sql: str) -> str:
         return "Not run. Fix these first:\n- " + "\n- ".join(check.problems)
 
     ctx.sql_runs += 1
+    bounded_sql = enforce_default_row_limit(sql, dialect=dialect)
     try:
         frame = execute_chat_sql(
             connector,
-            _sanitize_sql_for_dialect(sql, dialect or ""),
+            _sanitize_sql_for_dialect(bounded_sql, dialect or ""),
             kind="ReAct agent SQL",
         )
     except Exception as error:  # noqa: BLE001 — the model must see the failure

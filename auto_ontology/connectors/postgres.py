@@ -17,8 +17,22 @@ from psycopg_pool import ConnectionPool
 
 from auto_ontology.catalog.constants import TableTypes
 from auto_ontology.connectors.base import SQLDatabase, StatementTimeout
-from auto_ontology.connectors.session_context import require_postgres_tenant_guc
+from auto_ontology.connectors.session_context import (
+    postgres_rbac_role,
+    require_postgres_tenant_guc,
+)
 from auto_ontology.server.identity import CallerOboContext
+
+
+def _reset_pooled_connection(conn: psycopg.Connection) -> None:
+    """Roll back, then clear session state before *conn* returns to the pool.
+
+    ``DISCARD ALL`` fails inside an open transaction. A canceled caller query
+    can hand the connection back still in that transaction, so the reset rolls
+    back first and then drops roles, GUCs, and temp objects.
+    """
+    conn.rollback()
+    conn.execute("DISCARD ALL")
 
 
 def _fetch_frame(
@@ -63,6 +77,7 @@ class PostgresDatabase(SQLDatabase):
             max_idle=300.0,
             max_lifetime=1800.0,
             check=ConnectionPool.check_connection,
+            reset=_reset_pooled_connection,
             open=True,
         )
         # Close the pool at GC or interpreter exit (whichever comes first) so its
@@ -124,21 +139,27 @@ class PostgresDatabase(SQLDatabase):
             settings.append(("transaction_read_only", "on"))
         if timeout_s is not None:
             settings.append(("statement_timeout", f"{max(1, int(timeout_s * 1000))}ms"))
+        rbac_role = None
         if enforce_caller_rls:
             settings.extend(require_postgres_tenant_guc(obo_context))
+            rbac_role = postgres_rbac_role(obo_context)
         with self._pool.connection() as conn:
-            if not settings:
+            if not settings and rbac_role is None:
                 return _fetch_frame(conn, sql, parameters)
             started = time.monotonic()
             try:
                 with conn.transaction():
-                    conn.execute(
-                        "SELECT "
-                        + ", ".join(
-                            f"set_config('{name}', %s, true)" for name, _ in settings
-                        ),
-                        tuple(value for _, value in settings),
-                    )
+                    if rbac_role is not None:
+                        conn.execute(f"SET LOCAL ROLE {rbac_role}")
+                    if settings:
+                        conn.execute(
+                            "SELECT "
+                            + ", ".join(
+                                f"set_config('{name}', %s, true)"
+                                for name, _ in settings
+                            ),
+                            tuple(value for _, value in settings),
+                        )
                     return _fetch_frame(conn, sql, parameters)
             except psycopg.errors.QueryCanceled as exc:
                 # QueryCanceled also covers pg_cancel_backend(); only the

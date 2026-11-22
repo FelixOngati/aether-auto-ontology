@@ -939,8 +939,12 @@ def process_table(
     for col in ctx.get("columns", []):
         if pii_columns is None or col.get("name") in pii_columns:
             col["sample_values"] = None
-        elif scrub_enabled and isinstance(col.get("sample_values"), str):
-            col["sample_values"] = scrub_sample_text(col["sample_values"])
+        elif scrub_enabled:
+            samples = col.get("sample_values")
+            if isinstance(samples, str):
+                col["sample_values"] = scrub_sample_text(samples)
+            elif isinstance(samples, list):
+                col["sample_values"] = scrub_sample_list(samples)
     if pii_columns is None:
         clear_column_values(
             table_id,

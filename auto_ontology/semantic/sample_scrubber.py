@@ -29,6 +29,7 @@ _API_KEY_RE = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{16,}|nvapi-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,})\b"
 )
 _SSN_RE = re.compile(r"\b(?!000|666|9\d\d)\d{3}[- ](?!00)\d{2}[- ](?!0000)\d{4}\b")
+_SSN_DIGITS_RE = re.compile(r"(?<!\d)(?!000|666|9\d{2})\d{9}(?!\d)")
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,24}\b")
 _PAN_CANDIDATE_RE = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 _PHONE_RE = re.compile(
@@ -37,12 +38,15 @@ _PHONE_RE = re.compile(
 
 
 def is_sample_scrubbing_enabled() -> bool:
-    """Return ``True`` when automatic sample-value PII scrubbing is enabled."""
+    """Return ``True`` unless sample scrubbing is explicitly turned off.
+
+    Values that will be stored or embedded are scrubbed by default. Set
+    ``AUTO_ONTOLOGY_SCRUB_SAMPLE_VALUES=0`` to disable that.
+    """
     explicit = os.environ.get("AUTO_ONTOLOGY_SCRUB_SAMPLE_VALUES", "").strip().lower()
     if explicit:
         return explicit in _TRUTHY
-    offline = os.environ.get("AUTO_ONTOLOGY_OFFLINE_PERIMETER", "").strip().lower()
-    return offline in _TRUTHY
+    return True
 
 
 def _passes_luhn(digits: str) -> bool:
@@ -76,6 +80,7 @@ def scrub_sample_text(text: str) -> str:
         return text
     scrubbed = _API_KEY_RE.sub("[REDACTED:API_KEY]", text)
     scrubbed = _SSN_RE.sub("[REDACTED:SSN]", scrubbed)
+    scrubbed = _SSN_DIGITS_RE.sub("[REDACTED:SSN]", scrubbed)
     scrubbed = _PAN_CANDIDATE_RE.sub(_replace_luhn_pan, scrubbed)
     scrubbed = _EMAIL_RE.sub("[REDACTED:EMAIL]", scrubbed)
     scrubbed = _PHONE_RE.sub("[REDACTED:PHONE]", scrubbed)
@@ -83,9 +88,21 @@ def scrub_sample_text(text: str) -> str:
 
 
 def scrub_sample_value(value: Any) -> Any:
-    """Scrub *value* if it is a string; preserve numeric/boolean/null types."""
+    """Scrub strings, lists, and numeric identifiers.
+
+    A number is returned unchanged when its decimal text has no PII. A
+    nine-digit SSN stored as an integer is replaced with the redaction token.
+    """
     if isinstance(value, str):
         return scrub_sample_text(value)
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        text = str(value)
+        scrubbed = scrub_sample_text(text)
+        return value if scrubbed == text else scrubbed
+    if isinstance(value, (list, tuple)):
+        return [scrub_sample_value(item) for item in value]
     return value
 
 

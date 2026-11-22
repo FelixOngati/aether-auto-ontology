@@ -40,16 +40,20 @@ def list_connections() -> list[dict[str, Any]]:
     """
     connections: list[dict[str, Any]] = []
     for row in store().query_read(
-        select(s.catalog_database.c.name, s.catalog_database.c.connection).order_by(
-            s.catalog_database.c.name
-        )
+        select(
+            s.catalog_database.c.name,
+            s.catalog_database.c.connection,
+            s.catalog_database.c.tenant_id,
+        ).order_by(s.catalog_database.c.name)
     ):
         secret = read_secret(str(row["name"]))
+        payload: Any
         if secret:
-            connections.append(secret)
-            continue
-        stored = row["connection"]
-        if stored:
+            payload = secret
+        else:
+            stored = row["connection"]
+            if not stored:
+                continue
             if is_vault_required():
                 raise VaultSecretError(
                     f"Plaintext Postgres connection fallback is disabled for {row['name']!r}"
@@ -57,9 +61,10 @@ def list_connections() -> list[dict[str, Any]]:
             # jsonb here, a JSON *string* on the graph node. Callers get the
             # object either way, so decoding a string keeps a database written
             # before this column existed readable.
-            connections.append(
-                json.loads(stored) if isinstance(stored, str) else stored
-            )
+            payload = json.loads(stored) if isinstance(stored, str) else stored
+        if isinstance(payload, dict) and row["tenant_id"]:
+            payload = {**payload, "tenant_id": str(row["tenant_id"])}
+        connections.append(payload)
     return connections
 
 

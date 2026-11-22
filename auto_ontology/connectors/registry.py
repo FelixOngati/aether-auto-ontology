@@ -120,16 +120,30 @@ _connectors_by_tenant: dict[str, list[SQLDatabase]] = {}
 
 
 def _active_tenant_cache_key() -> str | None:
-    """Return active OBO ``tenant_id`` when multi-tenant context is bound."""
-    try:
-        from auto_ontology.server.identity import current_obo_context
+    """Return active OBO ``tenant_id`` when multi-tenant context is bound.
 
-        obo = current_obo_context()
-        if obo is not None and obo.tenant_id:
-            return obo.tenant_id
-    except Exception:
-        return None
+    A context lookup failure aborts the request. It does not fall through to
+    the process-wide connector list.
+    """
+    from auto_ontology.server.identity import current_obo_context
+
+    obo = current_obo_context()
+    if obo is not None and obo.tenant_id:
+        return obo.tenant_id
     return None
+
+
+def _connections_for_tenant(
+    connections: list[dict], tenant_id: str | None
+) -> list[dict]:
+    """Keep connection rows for *tenant_id* before any pool is opened."""
+    if not tenant_id:
+        return connections
+    return [
+        conn
+        for conn in connections
+        if str(conn.get("tenant_id") or "").strip() == tenant_id
+    ]
 
 
 def invalidate_connectors_cache(tenant_id: str | None = None) -> None:
@@ -251,7 +265,9 @@ def get_connectors_for_subject_token(
     from auto_ontology.dal.connections import list_connections
 
     try:
-        connections = list_connections()
+        connections = _connections_for_tenant(
+            list_connections(), _active_tenant_cache_key()
+        )
     except Exception:
         logger.exception("Failed to load connections for per-user Databricks auth")
         raise
@@ -321,14 +337,15 @@ def get_connectors() -> list[SQLDatabase]:
                     _schema_filter(conn),
                     _table_filter(conn),
                 )
-                for conn in list_connections()
+                for conn in _connections_for_tenant(list_connections(), tenant_key)
             ]
         except Exception:
             logger.exception("Failed to load connection strings from the catalog")
             specs = []
-        if not specs:
+        if not specs and tenant_key is None:
             # CONNECTION_STRINGS carries no connection dict, so an env-configured
-            # connection cannot express a table filter.
+            # connection cannot express a table filter. A bound tenant must not
+            # fall through to that unscoped list.
             raw = os.environ.get("CONNECTION_STRINGS", "")
             specs = [
                 (connection_string, None, TableFilter())

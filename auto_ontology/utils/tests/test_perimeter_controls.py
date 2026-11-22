@@ -45,7 +45,18 @@ def test_offline_perimeter_suppresses_cloud_defaults_and_blocks_cloud_urls(
     with pytest.raises(model_config.OfflinePerimeterError):
         model_config.resolve("REASONING", "ENDPOINT")
 
-    # Pointing at an internal Ollama / vLLM endpoint succeeds
+    # A schemeless vendor host has no URL hostname and is refused.
+    monkeypatch.setenv("DEFAULT_MODELS_ENDPOINT", "integrate.api.nvidia.com")
+    with pytest.raises(model_config.OfflinePerimeterError):
+        model_config.resolve("REASONING", "ENDPOINT")
+
+    # Any host outside the operator allowlist is refused, including other vendors.
+    monkeypatch.setenv("DEFAULT_MODELS_ENDPOINT", "https://api.groq.com/openai/v1")
+    with pytest.raises(model_config.OfflinePerimeterError):
+        model_config.resolve("REASONING", "ENDPOINT")
+
+    # Pointing at an allowlisted internal Ollama / vLLM endpoint succeeds
+    monkeypatch.setenv("AUTO_ONTOLOGY_OFFLINE_ALLOWED_HOSTS", "ollama")
     monkeypatch.setenv("DEFAULT_MODELS_ENDPOINT", "http://ollama:11434/v1")
     assert model_config.resolve("REASONING", "ENDPOINT") == "http://ollama:11434/v1"
     model_config.enforce_offline_perimeter_config()
@@ -64,6 +75,8 @@ def test_offline_perimeter_blocks_kumo_rfm_unless_explicit_local_override(
     assert prediction_enabled() is False
 
     # Internal self-hosted endpoint with explicit local override is permitted
+    # only when the operator listed that host.
+    monkeypatch.setenv("AUTO_ONTOLOGY_OFFLINE_ALLOWED_HOSTS", "kumo-nim.internal")
     monkeypatch.setenv("KUMO_RFM_API_URL", "http://kumo-nim.internal:8000")
     assert prediction_enabled() is True
 
@@ -100,7 +113,13 @@ def test_connector_registry_partitions_cache_by_tenant(
 
         obo = current_obo_context()
         tenant = obo.tenant_id if obo else "shared"
-        return [{"db_type": "sqlite", "database": f"/tmp/{tenant}.db"}]
+        return [
+            {
+                "db_type": "sqlite",
+                "database": f"/tmp/{tenant}.db",
+                "tenant_id": tenant,
+            }
+        ]
 
     created: list[str] = []
 
@@ -154,3 +173,46 @@ def test_catalog_tenant_rls_statements_and_applicator() -> None:
     count = apply_catalog_tenant_rls(conn, tables=("connections", "catalog_table"))
     assert count == 2
     assert conn.execute.call_count == 10
+
+
+def test_connector_lookup_failure_aborts_and_rows_are_filtered_by_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector_registry.invalidate_connectors_cache()
+
+    def boom() -> None:
+        raise RuntimeError("obo store unavailable")
+
+    monkeypatch.setattr("auto_ontology.server.identity.current_obo_context", boom)
+    with pytest.raises(RuntimeError, match="obo store unavailable"):
+        connector_registry.get_connectors()
+
+    monkeypatch.undo()
+    connector_registry.invalidate_connectors_cache()
+    rows = [
+        {"db_type": "sqlite", "database": "/tmp/a.db", "tenant_id": "tenant-a"},
+        {"db_type": "sqlite", "database": "/tmp/b.db", "tenant_id": "tenant-b"},
+    ]
+    created: list[str] = []
+
+    def _fake_create(cs: str, schemas=None, table_filter=None):
+        conn = MagicMock()
+        conn.database_name = cs
+        created.append(cs)
+        return conn
+
+    with (
+        patch("auto_ontology.dal.connections.list_connections", return_value=rows),
+        patch.object(
+            connector_registry,
+            "build_connection_string",
+            side_effect=lambda c: f"sqlite:///{c['database']}",
+        ),
+        patch.object(connector_registry, "create_connector", side_effect=_fake_create),
+        bind_obo_context(CallerOboContext(user_id="alice", tenant_id="tenant-a")),
+    ):
+        loaded = connector_registry.get_connectors()
+
+    assert [conn.database_name for conn in loaded] == ["sqlite:////tmp/a.db"]
+    assert created == ["sqlite:////tmp/a.db"]
+    connector_registry.invalidate_connectors_cache()

@@ -25,17 +25,6 @@ from urllib.parse import urlparse
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
-PUBLIC_CLOUD_INFERENCE_HOSTS: frozenset[str] = frozenset(
-    {
-        "integrate.api.nvidia.com",
-        "inference-api.nvidia.com",
-        "ai.api.nvidia.com",
-        "build.nvidia.com",
-        "api.openai.com",
-        "api.anthropic.com",
-    }
-)
-
 
 class OfflinePerimeterError(RuntimeError):
     """Raised when an offline perimeter deployment resolves a cloud endpoint."""
@@ -48,14 +37,34 @@ def is_offline_perimeter_enabled() -> bool:
     )
 
 
+def offline_allowed_hosts() -> frozenset[str]:
+    """Hosts an operator listed for offline inference."""
+    raw = os.environ.get("AUTO_ONTOLOGY_OFFLINE_ALLOWED_HOSTS", "")
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
+def endpoint_rejected_offline(url: str) -> bool:
+    """Return ``True`` when offline mode must refuse *url*.
+
+    Only an http or https URL whose host is in
+    ``AUTO_ONTOLOGY_OFFLINE_ALLOWED_HOSTS`` is accepted. A schemeless value has
+    no hostname and is refused. This is an operator allowlist, not a denylist
+    of vendor names.
+    """
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").strip().lower()
+    if parsed.scheme not in {"http", "https"} or not host:
+        return True
+    return host not in offline_allowed_hosts()
+
+
 def is_public_cloud_endpoint(url: str) -> bool:
-    """Return ``True`` when *url* targets a known public cloud inference API."""
-    if not url:
-        return False
-    host = (urlparse(url).hostname or "").strip().lower()
-    if not host:
-        return False
-    return host in PUBLIC_CLOUD_INFERENCE_HOSTS or host.endswith(".api.nvidia.com")
+    """Return ``True`` when offline mode must refuse *url*.
+
+    Kept as the name callers already use. The decision is
+    :func:`endpoint_rejected_offline`.
+    """
+    return endpoint_rejected_offline(url)
 
 
 # Built-in endpoint/model defaults, selected by the triplet's API key prefix.

@@ -49,6 +49,11 @@ def test_non_luhn_numbers_and_clean_categories_remain_intact() -> None:
     # 16 digits failing Luhn check are not falsely redacted as payment cards.
     assert scrub_sample_text("ORDER-1234567890123451") == "ORDER-1234567890123451"
     assert scrub_sample_value(42) == 42
+    assert scrub_sample_value(123456789) == "[REDACTED:SSN]"
+    assert scrub_sample_value(["user@example.com", 123456789]) == [
+        "[REDACTED:EMAIL]",
+        "[REDACTED:SSN]",
+    ]
     assert scrub_sample_value(3.14) == 3.14
     assert scrub_sample_value(True) is True
     assert scrub_sample_value(None) is None
@@ -72,13 +77,13 @@ def test_scrub_sample_mapping_preserves_date_warning_banner() -> None:
 def test_enablement_follows_env_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AUTO_ONTOLOGY_SCRUB_SAMPLE_VALUES", raising=False)
     monkeypatch.delenv("AUTO_ONTOLOGY_OFFLINE_PERIMETER", raising=False)
-    assert is_sample_scrubbing_enabled() is False
-
-    monkeypatch.setenv("AUTO_ONTOLOGY_OFFLINE_PERIMETER", "1")
     assert is_sample_scrubbing_enabled() is True
 
     monkeypatch.setenv("AUTO_ONTOLOGY_SCRUB_SAMPLE_VALUES", "0")
     assert is_sample_scrubbing_enabled() is False
+
+    monkeypatch.setenv("AUTO_ONTOLOGY_SCRUB_SAMPLE_VALUES", "1")
+    assert is_sample_scrubbing_enabled() is True
 
 
 def test_process_table_scrubs_untagged_email_samples_when_enabled(

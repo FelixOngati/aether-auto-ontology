@@ -45,13 +45,11 @@ def build_tenant_rls_statements(
     schema_name: str = "public",
     tenant_column: str = "tenant_id",
     guc_prefix: str | None = None,
-    allow_unset_admin_bypass: bool = False,
 ) -> list[str]:
     """Return idempotent PostgreSQL DDL statements enabling tenant RLS on *table_name*.
 
-    When *allow_unset_admin_bypass* is ``False`` (the zero-trust default), rows
-    are invisible whenever ``current_setting('<prefix>.tenant_id', true)`` is
-    empty or unset — failing closed if a caller forgets to bind tenant context.
+    An unset or empty tenant GUC matches no rows. There is no flag that makes
+    an unset GUC visible to every row.
     """
     tbl = _validate_identifier(table_name, "table")
     sch = _validate_identifier(schema_name, "schema")
@@ -59,17 +57,10 @@ def build_tenant_rls_statements(
     prefix = _validate_identifier(guc_prefix or rls_guc_prefix(), "GUC prefix")
     policy_name = _validate_identifier(f"{tbl}_tenant_isolation", "policy")
     guc_name = f"{prefix}.tenant_id"
-
-    if allow_unset_admin_bypass:
-        predicate = (
-            f"(NULLIF(current_setting('{guc_name}', true), '') IS NULL "
-            f"OR {col} = current_setting('{guc_name}', true))"
-        )
-    else:
-        predicate = (
-            f"(NULLIF(current_setting('{guc_name}', true), '') IS NOT NULL "
-            f"AND {col} = current_setting('{guc_name}', true))"
-        )
+    predicate = (
+        f"(NULLIF(current_setting('{guc_name}', true), '') IS NOT NULL "
+        f"AND {col} = current_setting('{guc_name}', true))"
+    )
 
     qualified = f'"{sch}"."{tbl}"'
     return [
@@ -91,9 +82,8 @@ def apply_catalog_tenant_rls(
     schema_name: str = "public",
     tenant_column: str = "tenant_id",
     guc_prefix: str | None = None,
-    allow_unset_admin_bypass: bool = False,
 ) -> int:
-    """Execute tenant RLS DDL for each table in *tables*; return policy count."""
+    """Execute fail-closed tenant RLS DDL for each table in *tables*."""
     applied = 0
     for table_name in tables:
         for stmt in build_tenant_rls_statements(
@@ -101,7 +91,6 @@ def apply_catalog_tenant_rls(
             schema_name=schema_name,
             tenant_column=tenant_column,
             guc_prefix=guc_prefix,
-            allow_unset_admin_bypass=allow_unset_admin_bypass,
         ):
             conn.execute(text(stmt))
         applied += 1

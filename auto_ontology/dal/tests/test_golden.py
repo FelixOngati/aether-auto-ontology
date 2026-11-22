@@ -116,6 +116,7 @@ OPTIONAL_KEYS: dict[str, frozenset[str]] = {
             "imported_id",
             "owner_id",
             "schema_id",
+            "tenant_id",
         }
     ),
     "datasources.fetch_node_properties_by_id": frozenset(
@@ -126,6 +127,7 @@ OPTIONAL_KEYS: dict[str, frozenset[str]] = {
             "imported_id",
             "owner_id",
             "schema_id",
+            "tenant_id",
         }
     ),
 }

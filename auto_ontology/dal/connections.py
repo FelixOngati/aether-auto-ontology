@@ -62,8 +62,9 @@ def list_connections() -> list[dict[str, Any]]:
             # object either way, so decoding a string keeps a database written
             # before this column existed readable.
             payload = json.loads(stored) if isinstance(stored, str) else stored
-        if isinstance(payload, dict) and row["tenant_id"]:
-            payload = {**payload, "tenant_id": str(row["tenant_id"])}
+        tenant_value = row["tenant_id"] if "tenant_id" in row.keys() else None
+        if isinstance(payload, dict) and tenant_value:
+            payload = {**payload, "tenant_id": str(tenant_value)}
         connections.append(payload)
     return connections
 

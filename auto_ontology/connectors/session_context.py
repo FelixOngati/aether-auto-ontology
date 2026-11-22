@@ -2,12 +2,20 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Caller On-Behalf-Of (OBO) session attribute formatting for SQL connectors.
+"""Caller On-Behalf-Of (OBO) session attributes for SQL connectors.
 
-Translates :class:`~auto_ontology.server.identity.CallerOboContext` into
-engine-specific transaction-local or per-connection session parameters so
-source databases can enforce Row-Level Security (RLS) policies without leaking
-caller identity across pooled connections.
+PostgreSQL is the only engine here that binds a transaction-local tenant GUC
+(``set_config``) for row-level security policies. A caller-facing Postgres
+query refuses to run when that tenant GUC cannot be set. An empty settings
+list is not permission to run as the pool role.
+
+Snowflake ``QUERY_TAG`` is an audit label. A row access policy does not read
+it, and this connector does not set a session variable those policies
+evaluate, so the tag does not filter rows.
+
+MySQL ``@aether_*`` user variables are caller attributes for that connection.
+This connector does not install a view or policy that reads them, so they do
+not filter rows either.
 """
 
 from __future__ import annotations
@@ -19,6 +27,10 @@ import re
 from auto_ontology.server.identity import CallerOboContext, current_obo_context
 
 _IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+class MissingCallerContextError(PermissionError):
+    """Caller-facing SQL was asked to run without a tenant RLS binding."""
 
 
 def resolve_effective_obo(
@@ -41,7 +53,12 @@ def rls_guc_prefix() -> str:
 def postgres_rls_settings(
     obo_context: CallerOboContext | None = None,
 ) -> list[tuple[str, str]]:
-    """Build transaction-local ``(guc_name, value)`` pairs for PostgreSQL ``set_config``."""
+    """Build transaction-local ``(guc_name, value)`` pairs for PostgreSQL ``set_config``.
+
+    Returns an empty list when no caller is bound. Caller-facing execution
+    must use :func:`require_postgres_tenant_guc` instead of treating that
+    empty list as a successful binding.
+    """
     obo = resolve_effective_obo(obo_context)
     if obo is None:
         return []
@@ -58,8 +75,31 @@ def postgres_rls_settings(
     return pairs
 
 
+def require_postgres_tenant_guc(
+    obo_context: CallerOboContext | None = None,
+) -> list[tuple[str, str]]:
+    """Return Postgres RLS settings, refusing when the tenant GUC is absent.
+
+    The pool login is often the table owner. PostgreSQL skips row-level
+    security for the owner unless the table uses ``FORCE ROW LEVEL SECURITY``,
+    so a query with no ``tenant_id`` GUC must not run at all.
+    """
+    settings = postgres_rls_settings(obo_context)
+    tenant_guc = f"{rls_guc_prefix()}.tenant_id"
+    if not any(name == tenant_guc and value for name, value in settings):
+        raise MissingCallerContextError(
+            "Refusing to run SQL without a transaction-local tenant GUC. "
+            "The pool role is not a substitute for caller row-level security."
+        )
+    return settings
+
+
 def snowflake_query_tag(obo_context: CallerOboContext | None = None) -> str | None:
-    """Serialize caller OBO identity as a deterministic JSON ``QUERY_TAG``."""
+    """Serialize caller identity as a Snowflake ``QUERY_TAG`` audit label.
+
+    The tag is not an input to a row access policy. Setting it does not
+    filter rows.
+    """
     obo = resolve_effective_obo(obo_context)
     if obo is None:
         return None
@@ -75,7 +115,11 @@ def snowflake_query_tag(obo_context: CallerOboContext | None = None) -> str | No
 def mysql_session_variables(
     obo_context: CallerOboContext | None = None,
 ) -> list[tuple[str, str]]:
-    """Build per-connection MySQL user session variable assignments."""
+    """Build per-connection MySQL user-variable assignments.
+
+    These are caller attributes for the connection. This connector does not
+    install a view or policy that reads them, so they do not filter rows.
+    """
     obo = resolve_effective_obo(obo_context)
     if obo is None:
         return []

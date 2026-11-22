@@ -131,6 +131,10 @@ class MySQLDatabase(SQLDatabase):
         never outlives the statement. MySQL applies ``max_execution_time`` to
         read-only ``SELECT`` only, which is all the agent issues.
 
+        When a caller is bound, the connection assigns ``@aether_*`` user
+        variables for that connection. This connector does not install a view
+        or policy that reads them, so they do not filter rows.
+
         Raises:
             StatementTimeout: the server stopped the statement at the cap.
         """

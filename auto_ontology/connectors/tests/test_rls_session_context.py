@@ -17,8 +17,10 @@ import pytest
 from auto_ontology.connectors.mysql import MySQLDatabase
 from auto_ontology.connectors.postgres import PostgresDatabase
 from auto_ontology.connectors.session_context import (
+    MissingCallerContextError,
     mysql_session_variables,
     postgres_rls_settings,
+    require_postgres_tenant_guc,
     rls_guc_prefix,
     snowflake_query_tag,
 )
@@ -121,6 +123,42 @@ def test_postgres_execute_injects_transaction_local_set_config_with_read_only() 
     assert set_params == ("on", "tenant-a", "alice@example.com", "EMEA")
     assert executed[2][0] == "SELECT revenue FROM accounts"
     assert executed[3] == ("COMMIT", None)
+
+
+def test_postgres_execute_refuses_without_a_tenant_guc() -> None:
+    executed: list[tuple[str, Any]] = []
+
+    class _FakePool:
+        @contextlib.contextmanager
+        def connection(self):
+            executed.append(("connection", None))
+            yield object()
+
+    db = object.__new__(PostgresDatabase)
+    db._pool = _FakePool()  # type: ignore[assignment]
+    db._database_name = "analytics"
+    db._finalizer = None  # type: ignore[assignment]
+
+    with pytest.raises(MissingCallerContextError, match="tenant GUC"):
+        db.execute("SELECT revenue FROM accounts")
+    assert executed == []
+
+    with bind_obo_context(
+        CallerOboContext(user_id="alice@example.com", tenant_id="", region="EMEA")
+    ):
+        with pytest.raises(MissingCallerContextError, match="tenant GUC"):
+            db.execute("SELECT revenue FROM accounts")
+    assert executed == []
+    with pytest.raises(MissingCallerContextError):
+        require_postgres_tenant_guc(None)
+
+
+def test_snowflake_query_tag_and_mysql_variables_are_not_row_filters() -> None:
+    snowflake_doc = " ".join((snowflake_query_tag.__doc__ or "").split())
+    mysql_doc = " ".join((mysql_session_variables.__doc__ or "").split())
+    assert "does not filter rows" in snowflake_doc
+    assert "row access policy" in snowflake_doc
+    assert "do not filter rows" in mysql_doc
 
 
 def test_snowflake_and_mysql_execute_propagate_obo_session_context(

@@ -573,7 +573,12 @@ async def chat_completions(
 
     # Conversation persistence trusts identity forwarded by the private Next.js
     # gateway; only calls that persist (i.e. carry a conversation_id) need it.
-    obo_context = resolve_obo_context(http_request, required=False)
+    obo_context = resolve_obo_context(http_request, required=True)
+    if not obo_context.tenant_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Caller tenant is required before SQL can run",
+        )
     user_id = resolve_internal_user(
         http_request, required=request.conversation_id is not None
     )

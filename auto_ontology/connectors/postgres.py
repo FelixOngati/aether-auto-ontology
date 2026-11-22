@@ -17,7 +17,7 @@ from psycopg_pool import ConnectionPool
 
 from auto_ontology.catalog.constants import TableTypes
 from auto_ontology.connectors.base import SQLDatabase, StatementTimeout
-from auto_ontology.connectors.session_context import postgres_rls_settings
+from auto_ontology.connectors.session_context import require_postgres_tenant_guc
 from auto_ontology.server.identity import CallerOboContext
 
 
@@ -71,7 +71,9 @@ class PostgresDatabase(SQLDatabase):
         # stalls shutdown ~5s per thread when a caller forgets to close(). Binding
         # ``self._pool.close`` (not ``self``) keeps the connector GC-eligible.
         self._finalizer = weakref.finalize(self, self._pool.close)
-        self._database_name: str = self.execute("SELECT current_database()").iloc[0, 0]
+        self._database_name: str = self._service_query(
+            "SELECT current_database()"
+        ).iloc[0, 0]
 
     @property
     def dialect(self) -> str:
@@ -98,6 +100,7 @@ class PostgresDatabase(SQLDatabase):
         timeout_s: float | None = None,
         read_only: bool = False,
         obo_context: CallerOboContext | None = None,
+        enforce_caller_rls: bool = True,
     ) -> pd.DataFrame:
         """Run *sql*; with *timeout_s*, the server cancels it after that long.
 
@@ -108,15 +111,21 @@ class PostgresDatabase(SQLDatabase):
         UPDATE``, ``nextval`` or a function that writes. It is set before
         *sql* runs, so *sql* cannot turn it back off.
 
+        Caller-facing statements (the default) require a transaction-local
+        tenant GUC. Schema probes use :meth:`_service_query`, which sets
+        ``enforce_caller_rls`` false and does not apply caller settings.
+
         Raises:
             StatementTimeout: the server cancelled the statement at the cap.
+            MissingCallerContextError: a caller-facing statement has no tenant GUC.
         """
         settings: list[tuple[str, str]] = []
         if read_only:
             settings.append(("transaction_read_only", "on"))
         if timeout_s is not None:
             settings.append(("statement_timeout", f"{max(1, int(timeout_s * 1000))}ms"))
-        settings.extend(postgres_rls_settings(obo_context))
+        if enforce_caller_rls:
+            settings.extend(require_postgres_tenant_guc(obo_context))
         with self._pool.connection() as conn:
             if not settings:
                 return _fetch_frame(conn, sql, parameters)
@@ -137,6 +146,28 @@ class PostgresDatabase(SQLDatabase):
                 if timeout_s is None or "statement timeout" not in str(exc):
                     raise
                 raise StatementTimeout.since(timeout_s, started) from exc
+
+    def _service_query(
+        self,
+        sql: str,
+        parameters: Optional[list] = None,
+        *,
+        timeout_s: float | None = None,
+        read_only: bool = False,
+    ) -> pd.DataFrame:
+        """Run a connector-owned probe that is not a caller query.
+
+        Catalog and connection statements use the pool login on purpose.
+        They do not apply caller GUCs and must not be treated as row-level
+        security for an end user.
+        """
+        return self.execute(
+            sql,
+            parameters,
+            timeout_s=timeout_s,
+            read_only=read_only,
+            enforce_caller_rls=False,
+        )
 
     # ------------------------------------------------------------------
     # Schema introspection
@@ -164,7 +195,7 @@ class PostgresDatabase(SQLDatabase):
         view_type = TableTypes.VIEW
         materialized_view_type = TableTypes.MATERIALIZED_VIEW
         base_table_type = TableTypes.BASE_TABLE
-        return self.execute(f"""
+        return self._service_query(f"""
             SELECT
                 n.nspname   AS table_schema,
                 c.relname   AS table_name,
@@ -212,7 +243,7 @@ class PostgresDatabase(SQLDatabase):
         catalogues, embeds and offers every table it cannot read, and every
         generated query against them dies with ``permission denied``.
         """
-        return self.execute("""
+        return self._service_query("""
             SELECT
                 n.nspname                        AS table_schema,
                 c.relname                        AS table_name,
@@ -243,7 +274,7 @@ class PostgresDatabase(SQLDatabase):
         """
         try:
             # Todo: Add filter of exclude information schema and pg_catalog tables
-            return self.execute(
+            return self._service_query(
                 """
                 SELECT
                     state_change AS end_time,
@@ -261,7 +292,7 @@ class PostgresDatabase(SQLDatabase):
             return pd.DataFrame(columns=["end_time", "query_text"])
 
     def get_views(self) -> pd.DataFrame:
-        return self.execute("""
+        return self._service_query("""
             SELECT
                 v.table_schema     AS table_schema,
                 v.table_name       AS table_name,
@@ -272,7 +303,7 @@ class PostgresDatabase(SQLDatabase):
         """)
 
     def get_pks(self) -> pd.DataFrame:
-        return self.execute("""
+        return self._service_query("""
             SELECT
                 kcu.table_schema         AS table_schema,
                 kcu.table_name           AS table_name,
@@ -307,7 +338,7 @@ class PostgresDatabase(SQLDatabase):
         in declared order; ``unnest`` over both zips them by position. Foreign
         keys whose tables are not catalogued are dropped later, in ``add_fks``.
         """
-        return self.execute("""
+        return self._service_query("""
             SELECT
                 src_ns.nspname   AS table_schema,
                 src.relname      AS table_name,

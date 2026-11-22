@@ -252,7 +252,7 @@ def _fake_postgres() -> tuple[PostgresDatabase, _PgConnection]:
 def test_postgres_scopes_the_timeout_to_one_transaction() -> None:
     database, conn = _fake_postgres()
 
-    database.execute("SELECT 1", timeout_s=1.5)
+    database.execute("SELECT 1", timeout_s=1.5, enforce_caller_rls=False)
 
     assert conn.log == [
         "BEGIN",
@@ -265,7 +265,7 @@ def test_postgres_scopes_the_timeout_to_one_transaction() -> None:
 def test_postgres_without_timeout_sends_no_setting() -> None:
     database, conn = _fake_postgres()
 
-    database.execute("SELECT 1")
+    database.execute("SELECT 1", enforce_caller_rls=False)
 
     assert conn.log == [("query", "SELECT 1")]
 
@@ -273,7 +273,9 @@ def test_postgres_without_timeout_sends_no_setting() -> None:
 def test_postgres_read_only_is_set_with_the_timeout_before_the_query() -> None:
     database, conn = _fake_postgres()
 
-    database.execute("SELECT 1", timeout_s=1.5, read_only=True)
+    database.execute(
+        "SELECT 1", timeout_s=1.5, read_only=True, enforce_caller_rls=False
+    )
 
     assert conn.log == [
         "BEGIN",
@@ -290,7 +292,7 @@ def test_postgres_read_only_is_set_with_the_timeout_before_the_query() -> None:
 def test_postgres_read_only_without_timeout_still_opens_a_transaction() -> None:
     database, conn = _fake_postgres()
 
-    database.execute("SELECT 1", read_only=True)
+    database.execute("SELECT 1", read_only=True, enforce_caller_rls=False)
 
     assert conn.log == [
         "BEGIN",
@@ -315,9 +317,13 @@ def test_live_postgres_cancels_and_does_not_leak_the_cap() -> None:
         pytest.skip(f"postgres not reachable: {exc}")
     try:
         with pytest.raises(StatementTimeout):
-            database.execute("SELECT pg_sleep(5)", timeout_s=0.3)
+            database.execute(
+                "SELECT pg_sleep(5)", timeout_s=0.3, enforce_caller_rls=False
+            )
         # The pool holds one idle connection; the cap must not have stuck to it.
-        setting = database.execute("SHOW statement_timeout").iloc[0, 0]
+        setting = database.execute(
+            "SHOW statement_timeout", enforce_caller_rls=False
+        ).iloc[0, 0]
         assert setting == "0"
     finally:
         database.close()
@@ -731,7 +737,7 @@ def test_postgres_statement_timeout_becomes_statement_timeout() -> None:
     )
 
     with pytest.raises(StatementTimeout) as caught:
-        database.execute("SELECT 1", timeout_s=30)
+        database.execute("SELECT 1", timeout_s=30, enforce_caller_rls=False)
     assert caught.value.timeout_s == 30
 
 
@@ -742,7 +748,7 @@ def test_postgres_other_cancellation_is_left_alone() -> None:
     )
 
     with pytest.raises(psycopg.errors.QueryCanceled):
-        database.execute("SELECT 1", timeout_s=30)
+        database.execute("SELECT 1", timeout_s=30, enforce_caller_rls=False)
 
 
 def _mysql_failing_with(monkeypatch: MonkeyPatch, errno: int) -> MySQLDatabase:

@@ -247,6 +247,11 @@ class SnowflakeDatabase(SQLDatabase):
 
         The cap is the ``STATEMENT_TIMEOUT_IN_SECONDS`` session parameter on the
         per-call connection, so it never outlives the statement.
+
+        When a caller is bound, the connection also sets ``QUERY_TAG`` to a
+        JSON audit label. A Snowflake row access policy does not read
+        ``QUERY_TAG``, and this connector does not set a session variable
+        those policies evaluate, so the tag does not filter rows.
         """
         connect_kwargs = self._connect_kwargs
         extra_session_params: dict[str, Any] = {}

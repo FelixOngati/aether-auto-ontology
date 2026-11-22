@@ -175,9 +175,17 @@ def execute_capped(connector: "SQLDatabase", sql: str) -> pd.DataFrame:
     every attribute with something truthy, and silently passing ``timeout_s``
     to a connector that does not take it would be a TypeError in production.
     """
+    kwargs: dict[str, object] = {}
+    # Catalog sampling is a service scan on the connection login. It is not a
+    # caller query, so Postgres must not treat a missing tenant GUC as a
+    # reason to refuse the probe or as row-level security for an end user.
+    if getattr(connector, "dialect", None) == "postgres":
+        kwargs["enforce_caller_rls"] = False
     if getattr(connector, "supports_statement_timeout", False) is True:
-        return connector.execute(sql, timeout_s=_PROFILING_QUERY_TIMEOUT_SECONDS)
-    return connector.execute(sql)
+        return connector.execute(
+            sql, timeout_s=_PROFILING_QUERY_TIMEOUT_SECONDS, **kwargs
+        )
+    return connector.execute(sql, **kwargs)
 
 
 class _SamplingCircuitBreaker:

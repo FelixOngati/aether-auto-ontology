@@ -1133,7 +1133,7 @@ def test_a_connector_without_a_cap_is_called_unchanged(*_mocks) -> None:
 
     calculate_columns_profiling(TABLE, COLUMNS, connector)
 
-    assert connector.execute.call_args_list[0].kwargs == {}
+    assert connector.execute.call_args_list[0].kwargs == {"enforce_caller_rls": False}
 
 
 def test_repeated_sample_timeouts_disable_sampling_for_the_run() -> None:

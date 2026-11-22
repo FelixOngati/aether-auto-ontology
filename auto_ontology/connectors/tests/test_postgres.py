@@ -25,6 +25,7 @@ import pytest
 
 from auto_ontology.catalog.constants import TableTypes
 from auto_ontology.connectors.postgres import PostgresDatabase
+from auto_ontology.server.identity import CallerOboContext, bind_obo_context
 from auto_ontology.connectors.registry import create_connector
 
 
@@ -310,21 +311,36 @@ def test_read_only_refuses_writes_under_a_select(
     pagila: PostgresDatabase, sql: str
 ) -> None:
     with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
-        pagila.execute(sql, read_only=True, timeout_s=10)
+        with bind_obo_context(
+            CallerOboContext(user_id="reader", tenant_id="tenant-pagila")
+        ):
+            pagila.execute(sql, read_only=True, timeout_s=10)
 
 
 def test_read_only_cannot_be_turned_off_by_the_statement(
     pagila: PostgresDatabase,
 ) -> None:
     with pytest.raises(psycopg.errors.ActiveSqlTransaction):
-        pagila.execute(
-            "SELECT set_config('transaction_read_only', 'off', true)", read_only=True
-        )
+        with bind_obo_context(
+            CallerOboContext(user_id="reader", tenant_id="tenant-pagila")
+        ):
+            pagila.execute(
+                "SELECT set_config('transaction_read_only', 'off', true)",
+                read_only=True,
+            )
 
 
 def test_read_only_reads_and_does_not_leak_onto_the_pool(
     pagila: PostgresDatabase,
 ) -> None:
-    rows = pagila.execute("SELECT count(*) AS n FROM actor", read_only=True)
+    with bind_obo_context(
+        CallerOboContext(user_id="reader", tenant_id="tenant-pagila")
+    ):
+        rows = pagila.execute("SELECT count(*) AS n FROM actor", read_only=True)
     assert int(rows.n.iloc[0]) > 0
-    assert pagila.execute("SHOW transaction_read_only").iloc[0, 0] == "off"
+    assert (
+        pagila.execute("SHOW transaction_read_only", enforce_caller_rls=False).iloc[
+            0, 0
+        ]
+        == "off"
+    )

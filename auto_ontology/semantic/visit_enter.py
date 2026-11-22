@@ -21,6 +21,7 @@ import pandas as pd
 
 from auto_ontology.connectors import get_connectors
 from auto_ontology.connectors.db_errors import is_infrastructure_error
+from auto_ontology.connectors.postgres import PostgresDatabase
 from auto_ontology.dal.attributes import merge_column_attribute
 from auto_ontology.dal.datasources import (
     clear_column_values,
@@ -175,9 +176,17 @@ def execute_capped(connector: "SQLDatabase", sql: str) -> pd.DataFrame:
     every attribute with something truthy, and silently passing ``timeout_s``
     to a connector that does not take it would be a TypeError in production.
     """
+    kwargs: dict[str, object] = {}
+    # Catalog sampling is a service scan on the connection login. It is not a
+    # caller query, so a real Postgres connector must not treat a missing
+    # tenant GUC as a reason to refuse the probe.
+    if isinstance(connector, PostgresDatabase):
+        kwargs["enforce_caller_rls"] = False
     if getattr(connector, "supports_statement_timeout", False) is True:
-        return connector.execute(sql, timeout_s=_PROFILING_QUERY_TIMEOUT_SECONDS)
-    return connector.execute(sql)
+        return connector.execute(
+            sql, timeout_s=_PROFILING_QUERY_TIMEOUT_SECONDS, **kwargs
+        )
+    return connector.execute(sql, **kwargs)
 
 
 class _SamplingCircuitBreaker:

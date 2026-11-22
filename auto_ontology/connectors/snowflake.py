@@ -18,6 +18,8 @@ import snowflake.connector
 from cryptography.hazmat.primitives import serialization
 
 from auto_ontology.connectors.base import SQLDatabase, StatementTimeout
+from auto_ontology.connectors.session_context import snowflake_query_tag
+from auto_ontology.server.identity import CallerOboContext
 
 logger = logging.getLogger(__name__)
 
@@ -239,19 +241,33 @@ class SnowflakeDatabase(SQLDatabase):
         parameters: Optional[list] = None,
         *,
         timeout_s: float | None = None,
+        obo_context: CallerOboContext | None = None,
     ) -> pd.DataFrame:
         """Run *sql*; with *timeout_s*, Snowflake cancels it after that long.
 
         The cap is the ``STATEMENT_TIMEOUT_IN_SECONDS`` session parameter on the
         per-call connection, so it never outlives the statement.
+
+        When a caller is bound, the connection also sets ``QUERY_TAG`` to a
+        JSON audit label. A Snowflake row access policy does not read
+        ``QUERY_TAG``, and this connector does not set a session variable
+        those policies evaluate, so the tag does not filter rows.
         """
         connect_kwargs = self._connect_kwargs
+        extra_session_params: dict[str, Any] = {}
         if timeout_s is not None:
+            extra_session_params["STATEMENT_TIMEOUT_IN_SECONDS"] = max(
+                1, int(timeout_s)
+            )
+        query_tag = snowflake_query_tag(obo_context)
+        if query_tag is not None:
+            extra_session_params["QUERY_TAG"] = query_tag
+        if extra_session_params:
             connect_kwargs = {
                 **connect_kwargs,
                 "session_parameters": {
                     **connect_kwargs.get("session_parameters", {}),
-                    "STATEMENT_TIMEOUT_IN_SECONDS": max(1, int(timeout_s)),
+                    **extra_session_params,
                 },
             }
         started = time.monotonic()

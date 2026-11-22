@@ -50,6 +50,12 @@ from auto_ontology.semantic.fk_suggester import (
     suggest_potential_foreign_keys,
 )
 from auto_ontology.semantic.models import ColumnAttributeSpec, ProcessTableResult
+from auto_ontology.semantic.sample_scrubber import (
+    is_sample_scrubbing_enabled,
+    scrub_sample_list,
+    scrub_sample_mapping,
+    scrub_sample_text,
+)
 from auto_ontology.semantic.term_extractor import (
     apply_display_names_to_specs,
     extract_term,
@@ -493,6 +499,8 @@ def _store_key_distinct_values(
         )
         if probed:
             values[column_name] = probed
+    if is_sample_scrubbing_enabled():
+        values = scrub_sample_mapping(values)
     store_column_distinct_values(table["id"], values)
 
 
@@ -867,6 +875,12 @@ def calculate_columns_profiling(
         if filtered:
             sample_values[col_name] = filtered
 
+    if is_sample_scrubbing_enabled():
+        sample_values = scrub_sample_mapping(sample_values)
+        for entry in profiling.values():
+            if isinstance(entry.get("sample_values"), list):
+                entry["sample_values"] = scrub_sample_list(entry["sample_values"])
+
     table_id = table["id"]
     store_column_sample_values(table_id, sample_values)
     store_column_uniqueness(table_id, uniqueness)
@@ -921,9 +935,16 @@ def process_table(
     except Exception:
         logger.debug("PII tag lookup failed", exc_info=True)
         pii_columns = None
+    scrub_enabled = is_sample_scrubbing_enabled()
     for col in ctx.get("columns", []):
         if pii_columns is None or col.get("name") in pii_columns:
             col["sample_values"] = None
+        elif scrub_enabled:
+            samples = col.get("sample_values")
+            if isinstance(samples, str):
+                col["sample_values"] = scrub_sample_text(samples)
+            elif isinstance(samples, list):
+                col["sample_values"] = scrub_sample_list(samples)
     if pii_columns is None:
         clear_column_values(
             table_id,

@@ -55,8 +55,6 @@ CONNECTOR_REGISTRY: dict[str, type[SQLDatabase]] = {
     "trino": TrinoDatabase,
 }
 
-_connectors: list[SQLDatabase] | None = None
-
 
 def parse_connection_strings(raw: str) -> list[str]:
     """Return connection URLs separated by commas, newlines, or both."""
@@ -117,9 +115,56 @@ def _table_filter(connection: dict) -> TableFilter:
         return TableFilter()
 
 
-def invalidate_connectors_cache() -> None:
-    """Drop cached connectors so the next :func:`get_connectors` reloads."""
+_connectors: list[SQLDatabase] | None = None
+_connectors_by_tenant: dict[str, list[SQLDatabase]] = {}
+
+
+def _active_tenant_cache_key() -> str | None:
+    """Return active OBO ``tenant_id`` when multi-tenant context is bound.
+
+    A context lookup failure aborts the request. It does not fall through to
+    the process-wide connector list.
+    """
+    from auto_ontology.server.identity import current_obo_context
+
+    obo = current_obo_context()
+    if obo is not None and obo.tenant_id:
+        return obo.tenant_id
+    return None
+
+
+def _connections_for_tenant(
+    connections: list[dict], tenant_id: str | None
+) -> list[dict]:
+    """Keep connection rows for *tenant_id* before any pool is opened."""
+    if not tenant_id:
+        return connections
+    return [
+        conn
+        for conn in connections
+        if str(conn.get("tenant_id") or "").strip() == tenant_id
+    ]
+
+
+def invalidate_connectors_cache(tenant_id: str | None = None) -> None:
+    """Drop cached connectors so the next :func:`get_connectors` reloads.
+
+    When *tenant_id* is given, only that tenant's cached connectors are closed
+    and evicted; otherwise both the shared and per-tenant caches are cleared.
+    """
     global _connectors
+    if tenant_id is not None:
+        bucket = _connectors_by_tenant.pop(tenant_id, None)
+        if bucket:
+            for connector in bucket:
+                try:
+                    connector.close()
+                except Exception:
+                    logger.exception(
+                        "Failed to close tenant connector during cache invalidation"
+                    )
+        return
+
     if _connectors is not None:
         for connector in _connectors:
             try:
@@ -127,6 +172,15 @@ def invalidate_connectors_cache() -> None:
             except Exception:
                 logger.exception("Failed to close connector during cache invalidation")
     _connectors = None
+    for bucket in list(_connectors_by_tenant.values()):
+        for connector in bucket:
+            try:
+                connector.close()
+            except Exception:
+                logger.exception(
+                    "Failed to close tenant connector during cache invalidation"
+                )
+    _connectors_by_tenant.clear()
 
 
 def create_connector(
@@ -211,7 +265,9 @@ def get_connectors_for_subject_token(
     from auto_ontology.dal.connections import list_connections
 
     try:
-        connections = list_connections()
+        connections = _connections_for_tenant(
+            list_connections(), _active_tenant_cache_key()
+        )
     except Exception:
         logger.exception("Failed to load connections for per-user Databricks auth")
         raise
@@ -264,7 +320,9 @@ def get_connectors() -> list[SQLDatabase]:
     physical databases) when wiring multiple connections.
     """
     global _connectors
-    if _connectors is None:
+    tenant_key = _active_tenant_cache_key()
+    cached = _connectors_by_tenant.get(tenant_key) if tenant_key else _connectors
+    if cached is None:
         from auto_ontology.dal.connections import list_connections
 
         # Each spec is (connection_string, schema_allowlist, table_filter). The
@@ -279,14 +337,15 @@ def get_connectors() -> list[SQLDatabase]:
                     _schema_filter(conn),
                     _table_filter(conn),
                 )
-                for conn in list_connections()
+                for conn in _connections_for_tenant(list_connections(), tenant_key)
             ]
         except Exception:
             logger.exception("Failed to load connection strings from the catalog")
             specs = []
-        if not specs:
+        if not specs and tenant_key is None:
             # CONNECTION_STRINGS carries no connection dict, so an env-configured
-            # connection cannot express a table filter.
+            # connection cannot express a table filter. A bound tenant must not
+            # fall through to that unscoped list.
             raw = os.environ.get("CONNECTION_STRINGS", "")
             specs = [
                 (connection_string, None, TableFilter())
@@ -313,5 +372,9 @@ def get_connectors() -> list[SQLDatabase]:
                 )
             seen_database_names.add(database_name)
             loaded.append(connector)
-        _connectors = loaded
-    return list(_connectors)
+        if tenant_key:
+            _connectors_by_tenant[tenant_key] = loaded
+        else:
+            _connectors = loaded
+        cached = loaded
+    return list(cached)

@@ -182,6 +182,7 @@ catalog_database = Table(
     METADATA,
     _id(),
     Column("name", Text, nullable=False, unique=True),
+    Column("tenant_id", Text, nullable=True),
     # UI-managed connection form. Stored here only when Vault is not configured;
     # with Vault the credentials live there and this stays null (the database
     # name is the lookup key -- there is no separate reference field).
@@ -210,6 +211,7 @@ catalog_schema = Table(
         nullable=False,
     ),
     Column("name", Text, nullable=False),
+    Column("tenant_id", Text, nullable=True),
     Column("description", Text, nullable=True),
     _certified("description_certified"),
     _imported_id(),
@@ -229,6 +231,7 @@ catalog_table = Table(
         nullable=False,
     ),
     Column("name", Text, nullable=False),
+    Column("tenant_id", Text, nullable=True),
     Column("description", Text, nullable=True),
     # Set from the UI's certification checkbox, via patch_catalog_node. Easy to
     # miss, because nothing in the ingest ever writes it
@@ -261,6 +264,7 @@ catalog_column = Table(
         nullable=False,
     ),
     Column("name", Text, nullable=False),
+    Column("tenant_id", Text, nullable=True),
     Column("description", Text, nullable=True),
     # As on catalog_table: written only by the UI's certification checkbox.
     _certified("description_certified"),

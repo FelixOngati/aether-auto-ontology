@@ -21,6 +21,51 @@ applies to the same triplet.
 from __future__ import annotations
 
 import os
+from urllib.parse import urlparse
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+class OfflinePerimeterError(RuntimeError):
+    """Raised when an offline perimeter deployment resolves a cloud endpoint."""
+
+
+def is_offline_perimeter_enabled() -> bool:
+    """Return ``True`` when ``AUTO_ONTOLOGY_OFFLINE_PERIMETER`` is enabled."""
+    return (
+        os.environ.get("AUTO_ONTOLOGY_OFFLINE_PERIMETER", "").strip().lower() in _TRUTHY
+    )
+
+
+def offline_allowed_hosts() -> frozenset[str]:
+    """Hosts an operator listed for offline inference."""
+    raw = os.environ.get("AUTO_ONTOLOGY_OFFLINE_ALLOWED_HOSTS", "")
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
+def endpoint_rejected_offline(url: str) -> bool:
+    """Return ``True`` when offline mode must refuse *url*.
+
+    Only an http or https URL whose host is in
+    ``AUTO_ONTOLOGY_OFFLINE_ALLOWED_HOSTS`` is accepted. A schemeless value has
+    no hostname and is refused. This is an operator allowlist, not a denylist
+    of vendor names.
+    """
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").strip().lower()
+    if parsed.scheme not in {"http", "https"} or not host:
+        return True
+    return host not in offline_allowed_hosts()
+
+
+def is_public_cloud_endpoint(url: str) -> bool:
+    """Return ``True`` when offline mode must refuse *url*.
+
+    Kept as the name callers already use. The decision is
+    :func:`endpoint_rejected_offline`.
+    """
+    return endpoint_rejected_offline(url)
+
 
 # Built-in endpoint/model defaults, selected by the triplet's API key prefix.
 # Keyed by ``<PREFIX>_<FIELD>``. API keys are intentionally absent (they have no
@@ -82,6 +127,8 @@ def _resolve_api_key(prefix: str) -> str:
 
 def _builtin_default(prefix: str, key: str) -> str:
     """Built-in default for ``<prefix>_<field>``, chosen by the key prefix."""
+    if is_offline_perimeter_enabled() and key.endswith("_ENDPOINT"):
+        return ""
     api_key = _resolve_api_key(prefix)
     for key_prefix, defaults in _DEFAULTS_BY_KEY_PREFIX.items():
         if api_key.startswith(key_prefix):
@@ -97,4 +144,40 @@ def resolve(prefix: str, field: str) -> str:
     triplet's API key is an ``sk-`` or ``nvapi-`` key.
     """
     key = f"{prefix}_{field}"
-    return os.environ.get(key, "") or _default(field) or _builtin_default(prefix, key)
+    resolved = (
+        os.environ.get(key, "") or _default(field) or _builtin_default(prefix, key)
+    )
+    if (
+        field == "ENDPOINT"
+        and resolved
+        and is_offline_perimeter_enabled()
+        and is_public_cloud_endpoint(resolved)
+    ):
+        raise OfflinePerimeterError(
+            f"Offline perimeter mode (AUTO_ONTOLOGY_OFFLINE_PERIMETER=1) forbids "
+            f"public cloud inference endpoint {resolved!r} for {key}."
+        )
+    return resolved
+
+
+def enforce_offline_perimeter_config() -> None:
+    """Verify required local model endpoints when ``AUTO_ONTOLOGY_OFFLINE_PERIMETER=1``."""
+    if not is_offline_perimeter_enabled():
+        return
+    required_prefixes = ("REASONING", "NON_REASONING", "EMBED")
+    missing: list[str] = []
+    for prefix in required_prefixes:
+        endpoint = resolve(prefix, "ENDPOINT").strip()
+        if not endpoint:
+            missing.append(f"{prefix}_ENDPOINT")
+    if missing:
+        raise OfflinePerimeterError(
+            "Offline perimeter mode (AUTO_ONTOLOGY_OFFLINE_PERIMETER=1) requires "
+            "explicit local model endpoints (or DEFAULT_MODELS_ENDPOINT); missing: "
+            + ", ".join(missing)
+        )
+    rerank_disabled = (
+        os.environ.get("AUTO_ONTOLOGY_DISABLE_RERANK", "").strip().lower() in _TRUTHY
+    )
+    if not rerank_disabled and os.environ.get("RERANK_ENDPOINT", "").strip():
+        resolve("RERANK", "ENDPOINT")

@@ -144,8 +144,30 @@ def prediction_enabled() -> bool:
 
     ``KUMO_RFM_API_URL`` must name a Universal TFM NIM serving the
     ``kumo-relational`` model; without it the ``predict`` tool is never offered.
+    In ``AUTO_ONTOLOGY_OFFLINE_PERIMETER=1`` mode, KumoRFM is disabled by
+    default unless ``AUTO_ONTOLOGY_ALLOW_LOCAL_KUMO=1`` is explicitly set for a
+    self-hosted non-cloud NIM endpoint.
     """
-    return bool(os.environ.get("KUMO_RFM_API_URL", "").strip())
+    from auto_ontology.utils.model_config import (
+        is_offline_perimeter_enabled,
+        is_public_cloud_endpoint,
+    )
+
+    kumo_url = os.environ.get("KUMO_RFM_API_URL", "").strip()
+    if not kumo_url:
+        return False
+    if is_offline_perimeter_enabled():
+        allow_local = os.environ.get(
+            "AUTO_ONTOLOGY_ALLOW_LOCAL_KUMO", ""
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not allow_local or is_public_cloud_endpoint(kumo_url):
+            return False
+    return True
 
 
 def max_predict_calls() -> int:

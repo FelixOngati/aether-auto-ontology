@@ -180,8 +180,9 @@ def test_pii_canaries_stay_put_when_the_tags_cannot_be_read() -> None:
     )
 
 
-def test_canaries_do_move_without_a_pii_tag() -> None:
-    """The harness can see a leak: untagged, the same canaries are everywhere."""
+def test_canaries_do_move_without_a_pii_tag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The harness can see a leak when scrubbing is turned off."""
+    monkeypatch.setenv("AUTO_ONTOLOGY_SCRUB_SAMPLE_VALUES", "0")
     warehouse = _SqliteWarehouse()
 
     recorded = _compile(warehouse, MagicMock(return_value=set()))
